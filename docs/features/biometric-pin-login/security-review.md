@@ -287,3 +287,107 @@ Section 7 negative tests: I confirmed by code reading that tests 1-14 (backend) 
 2. **Expo:** M-01, M-02, M-03 (client part), L-07, L-11, L-12.
 3. **Tech lead:** L-10, I-01, ruling (a) and (d) spec edits, L-01 contract change, SEC-009 amendment (ruling b), SEC-041/047 aggregate wording (H-01).
 4. **Both:** execute the device checklist before any claim of SEC-017/018/023/034/050/051/067 sign-off.
+
+---
+
+# Re-review (HEAD ab96c92, contract v1.1.0)
+
+Method and limits: static read only, as in the first review. I read the changed handlers, SQL, migration 000003, auth middleware, config, rate limiter, e2e `review_test.go`, and the Expo flows/session/config. I did not run `make api-test` or the Jest suites; the stated passes (Go suite, 213 unit and 198 contract tests) are taken as given and are not evidence about device behaviour. Nothing was verified on a physical device. Application code was not modified.
+
+## R1. Verdict
+
+**No open Critical. No open High. No open Medium.** All five original Medium findings and the High are closed or reduced to Low residuals. Seven Low and eleven Info items remain open (listed below); none blocks the demo. Sign-off scope is code level only: SEC-017/018/023/034/050/051/055/067 stay "needs device".
+
+## R2. Status of every prior finding
+
+| ID | Status | Evidence read |
+|---|---|---|
+| H-01 | **Closed** | `handlers/tx.go:86-138`: `LockUserRow` is the first statement in the DB tx (`:89`), then idempotency, then `coolingAggregate` (`:106-113`, rolling window `COOLING_OFF_WINDOW`, USD cap plus `COOLING_OFF_MAX_TX` count) and only then `stepup.Consume`. After consume, a `bio` proof is re-checked with `bioOverAggregate` (`:128-137`) and returns 403 `STEPUP_REQUIRED required=pin`. Any aggregate error returns an error from `InTx`, so the token consume rolls back (not burned). The sum (`tx_audit.sql SumTxByAsset`) joins `step_up_tokens` for the proof; the FK `transactions.step_up_token_hash -> step_up_tokens` and the absence of any token purge in `maintenance.go` mean the inner join cannot silently drop rows. Under READ COMMITTED the sum is a statement issued after the lock is held, so it sees every earlier committed insert. Index `transactions(user_id, created_at)` in migration 000003. Also checked at `/stepup/challenge` (`stepup.go:98-115`, advisory; re-enforced at submit). Test `review_test.go` covers split sends, count cap, 6 concurrent pre-minted tokens (exactly 2 succeed), and bio aggregate. Sums are exact `big.Rat`. |
+| M-01 | **Closed** (one small gap, N-01) | `crypto/challengeCheck.ts`; used before any biometric prompt in `unlock.ts:74`, `send.ts:45` (purpose, device id, bound hash equals the locally computed tx hash), `biometrics.ts:55`. Fails closed with no prompt. |
+| M-02 | **Closed** | `send.ts:45-46`: on divergence the challenge is dropped and `begin()` fails with `CHALLENGE_MISMATCH`; `proveWithBiometric`/`proveWithPin` refuse when `divergence`; `send.tsx:118-122` shows the user's own fields next to the server summary and disables Approve. |
+| M-03 | **Partially closed (accepted)** | Expo half closed: `account.ts:62-73` `signOut()` calls `DELETE /devices/{current}`, falls back to `/auth/logout`, always deletes the key and wipes credentials. Backend cap relief not implemented: `devices.go:75` still returns `DEVICE_LIMIT` with reset as the only escape. Low residual (N-04 for the offline case). |
+| M-04 | **Closed** | `server.go:252-259`: per-IP rules run first, the breaker is fed only by requests that passed them. Test `TestM04_OneIPCannotOpenGlobalBreaker`. |
+| M-05 | **Closed for demo scope** | Default and example `LISTEN_ADDR=127.0.0.1:8080` (`config.go:165`, `.env.example:17`); non-loopback bind logs a warning (`main.go:62-64`); `ENV=prod` refuses to start without `TRUSTED_PROXY=true` or a loopback bind (`config.go:306`); `requireHTTPSInProd` (`server.go:149-158`) rejects plain HTTP in prod. No TLS listener (ruling below). Caveat N-03. |
+| L-01 | **Closed** | `server.go:302-313` requires the device credential on both biometric endpoints; `DeviceCredential` (`auth/sessions.go:254-285`) has no side effects (no mark-used, no rotation), rejects used/revoked/idle/expired refresh tokens, a body deviceId different from the token's device, and revoked devices, all with the uniform 401. Five bad signatures now SUSPEND (`biometric.go:104-123`, `SuspendKey`), not revoke; challenge returns a decoy while suspended (`:77`), verify returns the uniform 401 (`:154`, `:160`), step-up bio is refused (`stepup.go:243`). `UnsuspendKey` runs only inside the successful `pin/verify` transaction after the PIN was accepted (`session.go:119`), not on step-up PIN, so a session holder cannot clear it. Revoke-and-re-enrol resets the state because a new key row has `bio_suspended_at` null. |
+| L-02 | **Closed** | `biometric.go:126-135`: decoy `userId` is `HMAC(macKey, "decoy-user-id-v1" || deviceId)` formatted as a v4-style UUID; `macKey` derives from the pepper (`common.go:58-62`), so it is stable per device and not guessable. Timing difference (two fewer DB writes) remains best effort per SEC-029. |
+| L-03 | **Closed** | `config.go:61` `DeviceFailMax=8`, window 1 h, block 1 h; lock-refused attempts are not counted (`session.go:96-98`). Test `TestRuling_b_DeviceBlockReachableWithDefaultSchedule` also proves 40 spam attempts during a lock do not extend it. |
+| L-04 | **Closed** | Separate classes `pinchange-user` and `pinreset-user` (`pin.go:133`, `:226`); test `TestL04_ChangeAndResetBucketsSeparate`. The change bucket is still charged before validation, which only affects the session holder's own change attempts. |
+| L-05 | **Partially closed (accepted)** | Bio step-up is refused while hard locked (`stepup.go:250-253`); PIN step-up is refused by the lockout. Sessions are still not revoked on transition to hard lock (known gap, ruling below). |
+| L-06 | **Closed** | `biometric.go:378-382`: another device's biometrics cannot be disabled without the PIN step-up path. Note the current-device case still returns `STEPUP_REQUIRED` with no valid way to satisfy it except re-unlock (client maps it to `REAUTH_REQUIRED`); acceptable. |
+| L-07 | **Closed** | `app.config.ts:4` defaults to `production`; `package.json` scripts and `eas.json` development profile set `development` explicitly; `check-manifest.mjs` default agrees. |
+| L-08 | **Partially closed** | Closed: startup self-check `CanModifyAudit` refuses to start if the runtime role can UPDATE/DELETE/TRUNCATE (`main.go:57-61`). Open: `PurgeAudit` still never called, `VerifyChain` only runs in tests (`leak_test.go:308`), chain still default off, audit write failures still swallowed for security-critical events. Low, acceptable for the demo. |
+| L-09 | **Closed** (new side effect N-02) | `ratelimit.go:13,55-64` caps at 100000 keys. |
+| L-10 | **Closed** | `X-StepUp-Token` is `required: false` with documented 403 `STEPUP_REQUIRED`/`STEPUP_INVALID` (`openapi.yaml:744-753`); placeholder hack gone from `server`/`common.go`; the harness validates every response with no status allowlist (`harness_test.go:217-235`); openapi has 17 shared error responses. I did not check each operation's declared error set one by one. |
+| L-11 | **Closed** (residual R3 stays) | `send.ts:61` passes `Confirm: <server summary title>` as the prompt text. Protected Confirmation is out of scope. |
+| L-12 | **Closed (risk reduced)** | A first 401 never wipes (`session.ts:14-19,91-94`, `unlock.ts:36`); biometric-path 401 never wipes (`unlock.ts:67`). Two consecutive injected 401s still wipe; acceptable because injection needs the cleartext dev transport. |
+| I-01 | **Closed** | `vectors.json:40` is 138; D-24. |
+| I-08 | **Closed** | `session.go:49` emits `LoginFail`. |
+| I-02..I-07, I-09 | Unchanged, accepted as before | - |
+
+Rulings b, c, e and the contract items (a, d, f) are implemented as ruled: (b) D-20 verified above; (c) D-18/D-19 verified above; (e) D-22 verified in `account.ts`; (a) `STEPUP_INVALID` is 403 throughout (`stepUpInvalid()`); (d) SEC-007/058 unused, 68 ids now; (f) items 1-3 closed (see L-10, I-01).
+
+## R3. New findings introduced by the fixes (and ones found while verifying)
+
+No new Critical, High or Medium.
+
+**Low**
+
+- **N-01 [EXPO] Challenge validation is incomplete for two PIN-only flows.** `flows/account.ts:46-48` (`revokeOtherDevice`) takes the server's `revoke_device` challenge without checking `deviceId` or that `boundHash === computeActionHash('revoke_device', target)`, and `flows/biometrics.ts:44` checks `deviceId` and `boundHash` for `enable_biometric` but not `purpose === 'stepup'`. The token is bound to whatever the server received, so a transport attacker who rewrites the request could point the PIN step-up at a different device. Needs the dev cleartext transport. Fix: add `isValidStepUpChallenge(ch.data, ownDeviceId, computeActionHash(action, target))` to both before `stepupVerifyPin`.
+- **N-02 [BACKEND] Limiter saturation resets every limiter.** `ratelimit/ratelimit.go:61-63`: when 100000 fresh keys exist, the whole map is replaced, which also clears the per-device and per-IP PIN-verify counters and the global ones. With device-id keys now behind the device credential, the practical trigger is 100000 distinct IPs (or forged `X-Forwarded-For` if N-03 applies). The durable user lockout is unaffected. Fix: evict the oldest N entries (or the shortest-window classes) instead of clearing, and never evict the `ip-global`/`pinverify-*` classes.
+- **N-03 [BACKEND] `TRUSTED_PROXY=true` is a trust switch, not a check.** `server.go:152` and `httpx/middleware.go:69-72,124` accept client-supplied `X-Forwarded-Proto` and the last `X-Forwarded-For` entry; `config.go:306` is satisfied by the flag alone even on a non-loopback bind. If the listener is reachable without the proxy, the HTTPS-in-prod guard and per-IP limits are spoofable. Fix: document that the listener must only be reachable from the proxy (private network or loopback), and in prod require a loopback or proxy-network bind when the flag is set. Prod is not a demo target, so Low.
+- **N-04 [EXPO] Sign-out failure is silent.** `settings.tsx:67` ignores the `{ deviceRevoked }` result of `signOut()`. If the device DELETE fails (offline, locked session), the server keeps the device row and the public key active, the local key and credentials are wiped, and the user is not told; repeated cases refill the 5-device cap (M-03 residual). The orphaned key cannot sign (private key deleted) and the refresh token is gone, so this is hygiene. Fix: show a notice when `deviceRevoked` is false and tell the user to remove the device from another device; backend: the auto-revoke of the stalest device (>30 d idle) after a successful PIN verify when the cap is hit.
+
+**Info**
+
+- **N-05 [BACKEND]** SEC-069 sums use the amount only, not the fee (`tx.go` `txFields` / `sumSince`); the fee is debited but not counted toward the USD caps. Also `COOLING_OFF_WINDOW` is not validated to be at least `COOLING_OFF_DURATION` (`config.go:283-285`); an operator can weaken the aggregate. Add the floor check.
+- **N-06** The device block (D-20) refuses a correct PIN for 1 h after 8 evaluated failures (`session.go:81-84`). Only a holder of the device credential can trigger it, and biometric login is unaffected. Intended; make sure the UI shows `retryAfter`.
+- **N-07** `DeviceCredential` accepts a device-bound `pin-verify` bootstrap token on the biometric endpoints (`auth/sessions.go:278`). Harmless (the signature is still required) but could be tightened to refresh tokens only.
+- **N-08** `authFailedStreak` (`session.ts:14`) is process-wide with no time decay; two unrelated 401s without a successful session between them wipe the identity. Matches the stated L-12 rule; consider decaying after a few minutes.
+- **N-09** Bio failure counter (`bio_fail_count`) is reset on login success and PIN unlock only, not on a successful step-up signature; slow accumulation of rare real failures could suspend biometrics. Reset it on step-up success too.
+- **N-10** The client does not pin `userId` from the first session response across challenges (my M-01 suggestion). The server rebuilds the signed message from its own row, so a wrong `userId` cannot produce an accepted signature. No action needed.
+
+## R4. Rulings on the engineers' known gaps
+
+| Gap | Ruling |
+|---|---|
+| SEC-069 limit is per user, not per device | **Acceptable.** Per-user is the stricter bound (an attacker cannot multiply the allowance by registering devices), and a new device already starts cooling-off. A per-device limit would be weaker. |
+| Sessions not revoked on hard lock | **Acceptable for the demo.** Both step-up proofs are refused while hard locked (PIN via the lockout, biometric via `stepup.go:250`), so a live session cannot move funds, change the PIN (old PIN needed) or enrol a key (PIN step-up needed). It can still read the dashboard and disable its own biometrics. Add `RevokeUserSessions` on the hard-lock transition before any real-value use. |
+| No TLS listener | **Acceptable for the demo** with loopback default, the LAN warning, the prod bind/proxy guard and the HTTPS-in-prod refusal. Do not treat the LAN mode as secure (R5). See N-03 for the proxy-trust caveat. |
+| Nothing verified on a physical device | **Acceptable for a code-level sign-off, not for a hardware claim.** SEC-017, 018, 023, 034, 050, 051, 055, 067 remain unproven (Secure Enclave/StrongBox flags, enrollment-change invalidation, `FLAG_SECURE`, app-switcher snapshot race, backup exclusion, release bundle contents). Run the device checklist and sign `apps/mobile/docs/sec7-matrix.md` before presenting the app as a working hardware-backed demo. |
+
+## R5. Updated SEC coverage
+
+Total ids: **68** (001-006, 005b, 008-057, 059-069; 007 and 058 intentionally unused; SEC-069 added). Legend as in section 5.
+
+| Status | Count | Ids |
+|---|---|---|
+| V (verified in code) | 56 | all others, now including 006 (demo scope, no TLS listener), 009, 011, 016, 020, 029, 030, 036, 039, 041, 043, 044, 047, 057, 069 |
+| V+D (code verified, needs device) | 8 | 017, 018, 023, 034, 050, 051, 055, 067 |
+| P (partial) | 3 | 022 (attestation not verified, demo), 035 (`amr` not read by step-up policy), 061 (audit retention/chain verification not delivered, L-08) |
+| C (claimed, not inspected) | 1 | 002 (`src/pin/policy.ts` not re-read; the server is the authority) |
+| N (not implemented) | 0 | - |
+
+Compared with the first review: P went from 12 to 3 (006, 009, 016, 029, 030, 041, 044, 047, 057 moved to V). Section 7 negative tests: 1-14 and 15-22 still map to implementation paths; tests 16 and the device-dependent parts of 17, 20, 21 are still manual and unexecuted.
+
+## R6. Open findings after re-review
+
+| Severity | Open | Items |
+|---|---|---|
+| Critical | 0 | - |
+| High | 0 | - |
+| Medium | 0 | - |
+| Low | 7 | M-03 residual (backend cap relief), L-05 residual (sessions on hard lock), L-08 residual (audit retention, chain, fail-closed events), N-01 (expo), N-02 (backend), N-03 (backend), N-04 (expo) |
+| Info | 11 | I-02, I-03, I-04, I-05, I-06, I-07, I-09, N-05, N-06 to N-10 as listed (I-01 and I-08 closed; N-xx new) |
+
+Closed since first review: 1 High, 4 Medium, 2 Medium-to-Low residual conversions (M-03, and M-05 for the demo), 10 Low, 2 Info.
+
+## R7. Residual risks
+
+- **R1** (unchanged) 10^6 PIN space; DB dump plus pepper exposes PINs; pepper in env, not KMS.
+- **R3** (unchanged) JS-level malware can ask the OS to sign attacker-chosen bytes behind a prompt that now carries the server summary title; bounded by the SEC-069 aggregate.
+- **R5** (reduced) The shared demo secret remains the recovery root of trust and is sniffable on a cleartext LAN; cooling-off is now effective (aggregate USD and count caps), so a reset gives at most the cooling-off allowance per window.
+- **R7** Rate-limit buckets and the demo breaker are in memory and reset on restart or saturation (N-02).
+- **R9** Lost refresh-rotation response strands the install (ADR-007); the Expo side no longer wipes on the first 401.
+- **R10** No attestation; `securityLevel` is self-reported; production policy forces PIN for `none` keys.
+- **R11 (new)** Aggregate caps are mock-USD from a static price table and per user. Real value needs a live price feed, fee inclusion (N-05) and per-asset/destination velocity rules.
+- Device-only controls (list in R4) are unproven until the checklist is run.
