@@ -149,7 +149,7 @@ func validatorRouter() (routers.Router, error) {
 // requireHTTPSInProd (M-05): with ENV=prod the server only trusts a TLS-terminating proxy; plain-HTTP requests are refused.
 func (b *builder) requireHTTPSInProd(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if b.o.Cfg.Env == "prod" && r.TLS == nil && !(b.o.Cfg.TrustedProxy && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")) {
+		if b.o.Cfg.Env == "prod" && r.TLS == nil && (!b.o.Cfg.TrustedProxy || !strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")) {
 			httpx.Validation().Write(w)
 			return
 		}

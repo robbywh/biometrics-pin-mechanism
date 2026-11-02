@@ -115,13 +115,13 @@ func TestH01_ConcurrentSubmissionsRespectAggregate(t *testing.T) {
 	wg.Wait()
 	require.EqualValues(t, 2, ok.Load())
 	require.EqualValues(t, 4, refused.Load())
-	require.Equal(t, "250", e.sumUSD())
+	require.Equal(t, "0.2", e.sumUSD(), "two 0.1 ETH sends = $500, the cap")
 	_ = e
 }
 
 func (e *env) sumUSD() string {
 	var s string
-	require.NoError(e.t, e.db.Pool.QueryRow(context.Background(), "SELECT trim_scale(COALESCE(sum(usd_value),0))::text FROM transactions").Scan(&s))
+	require.NoError(e.t, e.db.Pool.QueryRow(context.Background(), "SELECT trim_scale(COALESCE(sum(amount),0))::text FROM transactions").Scan(&s))
 	return s
 }
 
