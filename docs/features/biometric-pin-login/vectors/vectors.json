@@ -37,7 +37,7 @@
         "expiry": 1700000600
       },
       "equivalentInputs": [ { "amount": "1.50" }, { "amount": "1.500" } ],
-      "totalBytes": 140,
+      "totalBytes": 138,
       "segmentsHex": [
         "000f", "43525950544f4150502f54582f7631",
         "0003", "455448",

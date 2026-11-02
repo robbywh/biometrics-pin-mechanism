@@ -54,6 +54,14 @@ func run() int {
 		log.Error("database unreachable: refusing to start", "component", "main", "err_class", "store")
 		return 1
 	}
+	// L-08: the runtime role must not be able to alter the append-only audit table.
+	if can, err := store.New(pool).Q.CanModifyAudit(ctx); err != nil || can {
+		log.Error("database role can modify audit_events (use the least-privilege role): refusing to start", "component", "main", "err_class", "config")
+		return 1
+	}
+	if !config.IsLoopback(cfg.ListenAddr) && !cfg.TrustedProxy {
+		log.Warn("listening beyond loopback over plain HTTP: PIN, tokens and the demo secret are readable on this network (trusted LAN only)", "component", "main", "listen", cfg.ListenAddr)
+	}
 	clk := clock.System{}
 	if cfg.DemoMode {
 		if err := server.SeedDemo(ctx, store.New(pool), cfg, clk); err != nil {

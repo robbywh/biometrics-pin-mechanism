@@ -108,14 +108,18 @@ export default function Send() {
     return (
       <Screen scroll>
         <T kind="title">Confirm</T>
-        {flow.current.divergence ? <Banner tone="error" text="The details shown by the server differ from what you entered. Cancel and check them." /> : null}
         {error ? <Banner tone="error" text={error} /> : null}
         {/* Server-built summary: this is what the user approves (SEC-039), not locally formatted fields. */}
         <Card>
           <T kind="h2">{s?.title}</T>
           {s?.lines.map((l, i) => <T key={i}>{l}</T>)}
         </Card>
-        <Button title="Approve" onPress={() => void approve()} busy={busy} testID="approve" />
+        <Card>
+          <T kind="dim">You entered</T>
+          <T>{flow.current.fields.amount} {flow.current.fields.asset} to {flow.current.fields.destination}</T>
+          <T kind="dim">Fee {flow.current.fields.fee}</T>
+        </Card>
+        <Button title="Approve" onPress={() => void approve()} busy={busy} disabled={flow.current.divergence} testID="approve" />
         <Button title="Cancel" kind="secondary" onPress={() => { flow.current = null; setStage('form'); }} />
       </Screen>
     );

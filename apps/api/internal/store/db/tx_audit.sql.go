@@ -22,6 +22,18 @@ func (q *Queries) AuditChainLock(ctx context.Context) error {
 	return err
 }
 
+const canModifyAudit = `-- name: CanModifyAudit :one
+SELECT (has_table_privilege(current_user, 'audit_events', 'UPDATE') OR has_table_privilege(current_user, 'audit_events', 'DELETE')
+        OR has_table_privilege(current_user, 'audit_events', 'TRUNCATE'))::boolean AS can_modify
+`
+
+func (q *Queries) CanModifyAudit(ctx context.Context) (bool, error) {
+	row := q.db.QueryRow(ctx, canModifyAudit)
+	var can_modify bool
+	err := row.Scan(&can_modify)
+	return can_modify, err
+}
+
 const insertAudit = `-- name: InsertAudit :exec
 INSERT INTO audit_events (ts, user_id, device_id, event_type, result, ip, user_agent, request_id, metadata, prev_hash)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -203,4 +215,45 @@ func (q *Queries) PurgeAudit(ctx context.Context, ts time.Time) (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const sumTxByAsset = `-- name: SumTxByAsset :many
+SELECT t.asset, SUM(t.amount)::text AS total, count(*) AS n
+FROM transactions t JOIN step_up_tokens s ON s.token_hash = t.step_up_token_hash
+WHERE t.user_id = $1 AND t.created_at > $2 AND ($3::text = '' OR s.proof = $3::text)
+GROUP BY t.asset
+`
+
+type SumTxByAssetParams struct {
+	UserID    uuid.UUID
+	CreatedAt time.Time
+	Proof     string
+}
+
+type SumTxByAssetRow struct {
+	Asset string
+	Total string
+	N     int64
+}
+
+// SEC-069 rolling-window aggregate (amount per asset; USD is computed from the price table in Go). proof = ” counts every
+// transaction, 'bio' / 'pin' only those approved with that proof (join on the consumed step-up token). Call under the user row lock.
+func (q *Queries) SumTxByAsset(ctx context.Context, arg SumTxByAssetParams) ([]SumTxByAssetRow, error) {
+	rows, err := q.db.Query(ctx, sumTxByAsset, arg.UserID, arg.CreatedAt, arg.Proof)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SumTxByAssetRow{}
+	for rows.Next() {
+		var i SumTxByAssetRow
+		if err := rows.Scan(&i.Asset, &i.Total, &i.N); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

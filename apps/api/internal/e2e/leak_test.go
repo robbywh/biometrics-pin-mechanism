@@ -109,7 +109,7 @@ func TestSec7_11_NoSecretPropertiesInResponses(t *testing.T) {
 	d := bioDevice(t, e, "alice")
 	e.verifyPin(d, otherPIN)
 	e.do("GET", "/v1/devices", nil, bearer(d.access))
-	e.bioChallenge(d.id)
+	e.bioChallenge(d)
 	e.do("GET", "/v1/dashboard", nil, bearer(d.access))
 	banned := regexp.MustCompile(`(?i)^(pin|pinhash|oldpin|newpin|hash|salt|pepper|privatekey|pin_hash|secret)$`)
 	var walk func(v any)
@@ -226,6 +226,7 @@ func TestSec61_AuditEventCoverageAndChain(t *testing.T) {
 	e := newEnv(t, func(c *config.Config) {
 		c.AuditChain = true
 		c.LockSchedule = [5]int{1, 1, 1, 1, 1}
+		c.Limits.DeviceFailMax = 1000
 		c.Limits.DemoLoginIPMin = config.Limit{N: 40, Window: time.Minute}
 	})
 	// alice: PIN_SET, DEVICE_ADDED, LOGIN_OK, STEPUP_OK, BIO_ENROLLED, COOLING_OFF_STARTED
@@ -239,8 +240,8 @@ func TestSec61_AuditEventCoverageAndChain(t *testing.T) {
 	// BIO_VERIFY_FAIL, BIO_KEY_INVALIDATED
 	wrong, _ := newKey(t)
 	for i := 0; i < 5; i++ {
-		c := e.bioChallenge(a.id)
-		e.do("POST", "/v1/auth/biometric/verify", map[string]any{"challengeId": c.m()["challengeId"], "deviceId": a.id, "signature": sign(t, wrong, challengeMsg(t, c.m(), "login"))}, nil)
+		c := e.bioChallenge(a)
+		e.bioVerify(a, map[string]any{"challengeId": c.m()["challengeId"], "deviceId": a.id, "signature": sign(t, wrong, challengeMsg(t, c.m(), "login"))})
 	}
 	// BIO_DISABLED
 	e.enableBio(a, goodPIN)
@@ -270,7 +271,18 @@ func TestSec61_AuditEventCoverageAndChain(t *testing.T) {
 	rt, _ := e.demoLogin("bob", "reset")
 	nid, rr := e.register(rt, "recovery")
 	require.NotEmpty(t, nid, string(rr.Body))
-	require.Equal(t, 200, e.do("POST", "/v1/pin/reset", map[string]string{"pin": goodPIN}, withIdem(bearer(rt))).Status)
+	rres := e.do("POST", "/v1/pin/reset", map[string]string{"pin": goodPIN}, withIdem(bearer(rt)))
+	require.Equal(t, 200, rres.Status)
+	// DEVICE_BLOCKED on the recovery device (2 evaluated failures with a lowered limit)
+	e.cfg.Limits.DeviceFailMax = 2
+	e.restart()
+	rec := &device{id: nid}
+	rec.applySession(rres.m())
+	e.verifyPin(rec, otherPIN)
+	e.verifyPin(rec, otherPIN)
+	e.cfg.Limits.DeviceFailMax = 8
+	// LOGIN_FAIL
+	e.do("POST", "/v1/auth/demo-login", map[string]string{"username": "alice", "secret": "wrong-secret-value", "intent": "login"}, nil)
 	// RATE_LIMITED
 	e.cfg.Limits.DemoLoginIPMin = config.Limit{N: 1, Window: time.Minute}
 	e.restart()

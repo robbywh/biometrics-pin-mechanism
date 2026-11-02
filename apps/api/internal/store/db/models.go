@@ -81,6 +81,7 @@ type DeviceKey struct {
 	CreatedAt        time.Time
 	RevokedAt        *time.Time
 	RevokeReason     *string
+	BioSuspendedAt   *time.Time
 }
 
 type DevicePinFailure struct {

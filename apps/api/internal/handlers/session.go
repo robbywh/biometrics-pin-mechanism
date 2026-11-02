@@ -46,7 +46,7 @@ func (s *Server) DemoLogin(ctx context.Context, req apigen.DemoLoginRequestObjec
 		if uerr != nil && !store.NotFound(uerr) {
 			return nil, s.fail(ctx, "demoLogin", uerr)
 		}
-		s.Audit.Emit(ctx, audit.Event{Type: audit.LoginOK, Result: "fail", Meta: map[string]any{"method": "demo"}})
+		s.Audit.Emit(ctx, audit.Event{Type: audit.LoginFail, Result: "fail", Meta: map[string]any{"method": "demo"}})
 		return nil, httpx.AuthFailed()
 	}
 	scope := "pin-setup"
@@ -116,6 +116,9 @@ func (s *Server) VerifyPin(ctx context.Context, req apigen.VerifyPinRequestObjec
 			s.storeRisk(ctx, q, p.UserID, p.DeviceID, b.Risk, now)
 		}
 		_ = q.TouchDevice(ctx, db.TouchDeviceParams{ID: p.DeviceID, LastSeenAt: now})
+		if err := q.UnsuspendKey(ctx, p.DeviceID); err != nil { // PIN unlock re-enables a suspended biometric key
+			return err
+		}
 		out, err = s.sessionResponse(ctx, q, is, ptr(res.RecentFailures))
 		return err
 	})

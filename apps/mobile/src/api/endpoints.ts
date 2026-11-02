@@ -84,10 +84,12 @@ export const refresh = (refreshToken: string) => run(() => api().POST('/auth/ref
 export const logout = (token: string) => run(() => api().POST('/auth/logout', { headers: bearer(token) }));
 
 // ---- biometric ----
-export const biometricChallenge = (deviceId: string) => run(() => api().POST('/auth/biometric/challenge', { body: { deviceId } }));
-export async function biometricVerify(b: { challengeId: string; deviceId: string; signature: string }) {
+/** v1.1 (D-18): both biometric calls carry the device credential (refresh token) in Authorization. */
+export const biometricChallenge = (credential: string, deviceId: string) =>
+  run(() => api().POST('/auth/biometric/challenge', { body: { deviceId }, headers: bearer(credential) }));
+export async function biometricVerify(credential: string, b: { challengeId: string; deviceId: string; signature: string }) {
   const risk = await getRiskSignals();
-  return run(() => api().POST('/auth/biometric/verify', { body: { ...b, risk } }));
+  return run(() => api().POST('/auth/biometric/verify', { body: { ...b, risk }, headers: bearer(credential) }));
 }
 export const biometricEnrollChallenge = (token: string, deviceId: string, stepUpToken: string) =>
   run(() =>

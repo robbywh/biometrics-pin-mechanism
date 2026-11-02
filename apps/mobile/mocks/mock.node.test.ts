@@ -113,17 +113,51 @@ describe('mock backend conformance', () => {
     const spki = Buffer.concat([Buffer.from('3059301306072a8648ce3d020106082a8648ce3d030107034200', 'hex'), Buffer.from([4]), Buffer.alloc(64, 1)]).toString('base64url');
     const en = call('POST', `/v1/devices/${deviceId}/biometric/enroll`, { challengeId: ec.challengeId, publicKey: spki, attestation: { type: 'none', keySecurityLevel: 'tee' }, signature: 'AAAA' }, { ...A, 'Idempotency-Key': IDEM });
     expect(en.status).toBe(201);
-    const lc = call('POST', '/v1/auth/biometric/challenge', { deviceId }).body as any;
-    const vr = call('POST', '/v1/auth/biometric/verify', { challengeId: lc.challengeId, deviceId, signature: 'AAAA' });
+    const R = auth(session.refreshToken);
+    expect(call('POST', '/v1/auth/biometric/challenge', { deviceId }).status).toBe(401); // v1.1: credential required
+    const lc = call('POST', '/v1/auth/biometric/challenge', { deviceId }, R).body as any;
+    const vr = call('POST', '/v1/auth/biometric/verify', { challengeId: lc.challengeId, deviceId, signature: 'AAAA' }, R);
     expect(vr.status).toBe(200);
     expect((vr.body as any).amr).toBe('bio');
     // replay of the same challenge fails
-    expect(call('POST', '/v1/auth/biometric/verify', { challengeId: lc.challengeId, deviceId, signature: 'AAAA' }).status).toBe(401);
+    expect(call('POST', '/v1/auth/biometric/verify', { challengeId: lc.challengeId, deviceId, signature: 'AAAA' }, R).status).toBe(401);
+    // v1.1 (D-21): X-StepUp-Token is optional in the schema; missing => 403 STEPUP_REQUIRED
+    const noHdr = call('POST', '/v1/transactions', { asset: 'ETH', network: 'ethereum', destination: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1', fee: '0.001', txNonce: '33333333-3333-4333-8333-333333333333', expiry: 1700000600 }, { ...A, 'Idempotency-Key': IDEM });
+    expect([noHdr.status, (noHdr.body as any).error.code]).toEqual([403, 'STEPUP_REQUIRED']);
     // bad key => INVALID_PUBLIC_KEY
     const ch2 = call('POST', '/v1/stepup/challenge', { action: 'enable_biometric', targetDeviceId: deviceId }, A).body as any;
     const su2 = (call('POST', '/v1/stepup/verify', { challengeId: ch2.challengeId, pin: PIN }, A).body as any).stepUpToken;
     const ec2 = call('POST', `/v1/devices/${deviceId}/biometric/enroll/challenge`, undefined, { ...A, 'X-StepUp-Token': su2 }).body as any;
     const bad = call('POST', `/v1/devices/${deviceId}/biometric/enroll`, { challengeId: ec2.challengeId, publicKey: 'AAAA', attestation: { type: 'none', keySecurityLevel: 'tee' }, signature: 'AAAA' }, { ...A, 'Idempotency-Key': '4f2b8c1a-0d4e-4f6a-9b7c-1a2b3c4d5e6f' });
     expect((bad.body as any).error.code).toBe('INVALID_PUBLIC_KEY');
+  });
+});
+
+describe('contract v1.1 model', () => {
+  it('no operation requires X-StepUp-Token and every operation declares a default error response', () => {
+    for (const op of operations) {
+      expect(op.requiredHeaders).not.toContain('x-stepup-token');
+      expect(Object.keys(op.responses)).toContain('default');
+    }
+  });
+  it('undeclared status (e.g. 500) is served via the default ErrorResponse and validates', () => {
+    expect(() => b.handle({ method: 'GET', path: '/v1/dashboard', headers: {} })).not.toThrow();
+  });
+  it('5 bad biometric verifications suspend biometrics until the next PIN unlock; the key stays active', async () => {
+    const { deviceId, session } = await onboard();
+    const A = auth(session.accessToken);
+    const R = auth(session.refreshToken);
+    const ch = call('POST', '/v1/stepup/challenge', { action: 'enable_biometric', targetDeviceId: deviceId }, A).body as any;
+    const su = (call('POST', '/v1/stepup/verify', { challengeId: ch.challengeId, pin: PIN }, A).body as any).stepUpToken;
+    const ec = call('POST', `/v1/devices/${deviceId}/biometric/enroll/challenge`, undefined, { ...A, 'X-StepUp-Token': su }).body as any;
+    const spki = Buffer.concat([Buffer.from('3059301306072a8648ce3d020106082a8648ce3d030107034200', 'hex'), Buffer.from([4]), Buffer.alloc(64, 1)]).toString('base64url');
+    call('POST', `/v1/devices/${deviceId}/biometric/enroll`, { challengeId: ec.challengeId, publicKey: spki, attestation: { type: 'none', keySecurityLevel: 'tee' }, signature: 'AAAA' }, { ...A, 'Idempotency-Key': IDEM });
+    for (let i = 0; i < 5; i++) call('POST', '/v1/auth/biometric/verify', { challengeId: '7b1f0f3e-8d2a-4b53-a1c4-5e6f7a8b9c0d', deviceId, signature: 'AAAA' }, R);
+    expect(b.isBioSuspended(deviceId)).toBe(true);
+    expect(b.deviceById(deviceId)!.biometricEnabled).toBe(true); // key not revoked
+    const lc = call('POST', '/v1/auth/biometric/challenge', { deviceId }, R).body as any;
+    expect(call('POST', '/v1/auth/biometric/verify', { challengeId: lc.challengeId, deviceId, signature: 'AAAA' }, R).status).toBe(401);
+    call('POST', '/v1/auth/pin/verify', { deviceId, pin: PIN }, R);
+    expect(b.isBioSuspended(deviceId)).toBe(false);
   });
 });

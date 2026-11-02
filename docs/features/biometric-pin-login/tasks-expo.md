@@ -10,6 +10,13 @@ Owner: expo-engineer. 22 tasks, each <= ~half a day. Order T1..T22. Dependencies
 - Workspace: pnpm workspaces (`apps/*`). Generated code goes to `apps/mobile/src/api/generated` (git-ignored or committed, pick one; `pnpm gen:api` must be idempotent).
 - Security non-negotiables: PIN only in a ref buffer; no `console.*` in auth code; never put tokens/PIN in navigation params, state libs, AsyncStorage, logs; biometrics = native signature, never a boolean (SEC-019).
 
+## Contract v1.1 amendments (security review) - these OVERRIDE any older task statement below
+- `POST /auth/biometric/challenge` and `POST /auth/biometric/verify` now require `Authorization: Bearer <refresh token>` (same device credential as pin/verify). T14 must send it on both calls. Any 401 there is a normal biometric failure (go to PIN screen) and must NOT wipe the refresh token, deviceId or key (L-12). After 5 bad signatures the server suspends biometrics until the next PIN unlock (key is not revoked): the client simply falls back to PIN. (D-18, D-19)
+- Sign out (T18): user-facing Sign out calls `DELETE /devices/{current}` first, then wipes SecureStore credentials and the local key; `POST /auth/logout` is end-session only and is not a substitute. (D-22)
+- `X-StepUp-Token` is optional in the schema; handle 403 `STEPUP_REQUIRED` and 403 `STEPUP_INVALID` on `POST /transactions` and enroll challenge as before. Every operation has a `default` error response; regenerate types (`pnpm gen:api`) and make the typed error mapper accept the shared body. Mock (T3) must serve these. (D-21)
+- T19: display-only impact of SEC-069 (`COOLING_OFF` 403 or `required=pin` may appear after several small transactions).
+- `vectors.json` `tx-preimage-1` totalBytes is 138 (segments were always correct).
+
 ## T1 Scaffold workspace and Expo app
 - **Status (expo-engineer): DONE. Workspace + Expo SDK 58 app, eas.json, ESLint (no-console, restricted imports), Jest (node + jest-expo), README, mobile.yml. `expo prebuild` verified for development and production variants; `scripts/check-manifest.mjs` passes (allowBackup=false, cleartext only in debug manifest, ATS local exception only in development variant). Not verified: that Expo Go refuses to open the app (documented only).**
 - Depends on: (none)

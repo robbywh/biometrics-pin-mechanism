@@ -24,6 +24,7 @@ export function flowErrorText(e: FlowError | { code: string }): string {
     case 'PIN_MISMATCH': return 'The two PINs do not match.';
     case 'PIN_WEAK_LOCAL': return 'Choose a less predictable PIN.';
     case 'NO_FLOW': case 'NO_SESSION': return 'Please start again.';
+    case 'CHALLENGE_MISMATCH': return 'The server response did not match your request. Nothing was approved. Please start again.';
     case 'REAUTH_REQUIRED': return 'Please confirm your PIN again.';
     case 'BIO_UNAVAILABLE': return 'Biometrics are not available or not set up on this device.';
     case 'BIO_KEY_ERROR': return 'Biometrics could not be enabled. Try again.';

@@ -121,6 +121,10 @@ describe('PIN unlock lock states (T13)', () => {
     const orig = backend.handle.bind(backend);
     backend.handle = (r) => (r.path.endsWith('/pin/verify') ? { status: 401, headers: {}, body: { error: { code: 'AUTH_FAILED', message: 'x' } } } : orig(r));
     await unlockWithPin(pinOf(PIN));
+    // L-12: a single AUTH_FAILED never wipes the identity
+    expect(authState.get().status).toBe('locked');
+    expect(await getRefreshToken()).toBeTruthy();
+    await unlockWithPin(pinOf(PIN));
     backend.handle = orig;
     expect(authState.get().status).toBe('onboarding');
     expect(await getRefreshToken()).toBeNull();
@@ -241,6 +245,51 @@ describe('biometric unlock (T14, tests 15/16/17/22)', () => {
     const deviceId = await enrolled();
     backend.deviceById(deviceId)!.biometricEnabled = false; // server no longer lists a key -> decoy challenge
     expect(await unlockWithBiometric()).toEqual({ status: 'fallback', reason: 'SERVER_REJECTED' });
+  });
+});
+
+describe('biometric v1.1: device credential, no wipe on 401, suspension (D-18, D-19)', () => {
+  async function enrolled() {
+    const { deviceId } = await onboardUnlocked();
+    await enableBiometrics(pinOf(PIN));
+    lock();
+    backend.log.length = 0;
+    return deviceId;
+  }
+  it('sends the refresh token as Authorization on challenge and verify', async () => {
+    await enrolled();
+    const refresh = await getRefreshToken();
+    expect(await unlockWithBiometric()).toEqual({ status: 'unlocked' });
+    for (const op of ['biometricChallenge', 'biometricVerify']) {
+      expect(backend.log.find((l) => l.op === op)!.headers.authorization).toBe(`Bearer ${refresh}`);
+    }
+  });
+  it('a 401 on challenge/verify falls back to PIN and wipes nothing (repeatedly)', async () => {
+    const deviceId = await enrolled();
+    const orig = backend.handle.bind(backend);
+    backend.handle = (r) => (r.path.startsWith('/v1/auth/biometric') ? { status: 401, headers: {}, body: { error: { code: 'AUTH_FAILED', message: 'x' } } } : orig(r));
+    for (let i = 0; i < 3; i++) expect(await unlockWithBiometric()).toEqual({ status: 'fallback', reason: 'SERVER_REJECTED' });
+    backend.handle = orig;
+    expect(await getRefreshToken()).toBeTruthy();
+    expect(await getDeviceId()).toBe(deviceId);
+    expect(fakeKey.keys.has(biometricAlias(deviceId))).toBe(true);
+    expect(await getBiometricHint()).toBe(true);
+    expect(authState.get().status).toBe('locked');
+  });
+  it('after 5 bad signatures the server suspends biometrics: client falls back to PIN, key kept; PIN unlock restores it', async () => {
+    const deviceId = await enrolled();
+    for (let i = 0; i < 5; i++) {
+      // stale challenge id => the uniform failure the server counts
+      await api.biometricVerify((await getRefreshToken())!, { challengeId: '7b1f0f3e-8d2a-4b53-a1c4-5e6f7a8b9c0d', deviceId, signature: 'AAAA' });
+    }
+    expect(backend.isBioSuspended(deviceId)).toBe(true);
+    expect(await unlockWithBiometric()).toEqual({ status: 'fallback', reason: 'SERVER_REJECTED' });
+    expect(fakeKey.keys.has(biometricAlias(deviceId))).toBe(true);
+    expect(await getBiometricHint()).toBe(true);
+    expect(backend.deviceById(deviceId)!.biometricEnabled).toBe(true);
+    expect((await unlockWithPin(pinOf(PIN))).ok).toBe(true);
+    lock();
+    expect(await unlockWithBiometric()).toEqual({ status: 'unlocked' });
   });
 });
 
@@ -450,15 +499,119 @@ describe('Idempotency-Key policy', () => {
   });
 });
 
-describe('sign out', () => {
-  it('calls /auth/logout then wipes credentials, key and hint', async () => {
-        await onboardUnlocked();
+describe('sign out (M-03)', () => {
+  it('revokes the current device (DELETE /devices/{id}) then wipes credentials, key and hint', async () => {
+    const { deviceId } = await onboardUnlocked();
     await enableBiometrics(pinOf(PIN));
-    await signOut();
-    expect(backend.log.some((l) => l.op === 'logout')).toBe(true);
+    expect(await signOut()).toEqual({ deviceRevoked: true });
+    expect(backend.log.some((l) => l.op === 'revokeDevice')).toBe(true);
+    expect(backend.deviceById(deviceId)!.revoked).toBe(true);
+    expect(backend.deviceById(deviceId)!.biometricEnabled).toBe(false);
     expect(authState.get().status).toBe('onboarding');
     expect(await getRefreshToken()).toBeNull();
     expect(fakeKey.keys.size).toBe(0);
     expect(await getBiometricHint()).toBe(false);
+  });
+  it('device delete fails (offline): falls back to logout attempt and still wipes locally', async () => {
+    await onboardUnlocked();
+    await enableBiometrics(pinOf(PIN));
+    const orig = backend.handle.bind(backend);
+    backend.handle = (r) => { if (r.method === 'DELETE') throw new Error('offline'); return orig(r); };
+    expect(await signOut()).toEqual({ deviceRevoked: false });
+    backend.handle = orig;
+    expect(backend.log.some((l) => l.op === 'logout')).toBe(true);
+    expect(authState.get().status).toBe('onboarding');
+    expect(await getRefreshToken()).toBeNull();
+    expect(fakeKey.keys.size).toBe(0);
+  });
+});
+
+// ---- M-01 / M-02: tampered server challenges are never signed ----
+function tamper(op: string, patch: (b: any) => void) {
+  const orig = backend.handle.bind(backend);
+  backend.handle = (req) => {
+    const res = orig(req);
+    const m = req.path.endsWith('/auth/biometric/challenge') ? 'biometricChallenge' : req.path.endsWith('/stepup/challenge') ? 'stepupChallenge' : req.path.endsWith('/enroll/challenge') ? 'biometricEnrollChallenge' : '';
+    if (m === op && res.status === 200) patch(res.body);
+    return res;
+  };
+  return () => { backend.handle = orig; };
+}
+
+describe('tampered challenges are refused before any signing (M-01)', () => {
+  async function enrolled() {
+    await onboardUnlocked();
+    await enableBiometrics(pinOf(PIN));
+    lock();
+    fakeKey.signed.length = 0;
+  }
+  it.each([
+    ['purpose=stepup', (b: any) => { b.purpose = 'stepup'; }],
+    ['purpose=enroll', (b: any) => { b.purpose = 'enroll'; }],
+    ['other deviceId', (b: any) => { b.deviceId = '99999999-9999-4999-8999-999999999999'; }],
+    ['boundHash present', (b: any) => { b.boundHash = 'X1l0fN0mL8w1y0n4Wq3kVx5g0m2S8bJp9d7oUqz1HcE'; }],
+  ])('login challenge with %s', async (_n, patch) => {
+    await enrolled();
+    const undo = tamper('biometricChallenge', patch);
+    expect(await unlockWithBiometric()).toEqual({ status: 'fallback', reason: 'SERVER_REJECTED' });
+    undo();
+    expect(fakeKey.signed).toHaveLength(0);
+    expect(backend.log.some((l) => l.op === 'biometricVerify')).toBe(false);
+    expect(authState.get().status).toBe('locked');
+  });
+  it.each([
+    ['purpose=login', (b: any) => { b.purpose = 'login'; }],
+    ['other deviceId', (b: any) => { b.deviceId = '99999999-9999-4999-8999-999999999999'; }],
+    ['boundHash present', (b: any) => { b.boundHash = 'X1l0fN0mL8w1y0n4Wq3kVx5g0m2S8bJp9d7oUqz1HcE'; }],
+  ])('enroll challenge with %s: no key is created', async (_n, patch) => {
+    await onboardUnlocked();
+    const undo = tamper('biometricEnrollChallenge', patch);
+    expect(await enableBiometrics(pinOf(PIN))).toMatchObject({ ok: false, error: { code: 'CHALLENGE_MISMATCH' } });
+    undo();
+    expect(fakeKey.keys.size).toBe(0);
+    expect(fakeKey.signed).toHaveLength(0);
+    expect(await getBiometricHint()).toBe(false);
+  });
+  it('enable_biometric step-up challenge bound to another action is refused before the PIN is sent', async () => {
+    await onboardUnlocked();
+    const undo = tamper('stepupChallenge', (b) => { b.boundHash = 'X1l0fN0mL8w1y0n4Wq3kVx5g0m2S8bJp9d7oUqz1HcE'; });
+    expect(await enableBiometrics(pinOf(PIN))).toMatchObject({ ok: false, error: { code: 'CHALLENGE_MISMATCH' } });
+    undo();
+    expect(backend.log.some((l) => l.op === 'stepupVerify')).toBe(false);
+  });
+});
+
+describe('step-up divergence blocks the flow (M-01, M-02)', () => {
+  it.each([
+    ['txHash differs (attacker tx)', (b: any) => { b.txHash = 'X1l0fN0mL8w1y0n4Wq3kVx5g0m2S8bJp9d7oUqz1HcE'; b.boundHash = b.txHash; }],
+    ['boundHash differs only', (b: any) => { b.boundHash = 'X1l0fN0mL8w1y0n4Wq3kVx5g0m2S8bJp9d7oUqz1HcE'; }],
+    ['purpose=login', (b: any) => { b.purpose = 'login'; }],
+    ['other deviceId', (b: any) => { b.deviceId = '99999999-9999-4999-8999-999999999999'; }],
+  ])('%s: no biometric prompt, no PIN sent, no transaction', async (_n, patch) => {
+    await onboardUnlocked();
+    await enableBiometrics(pinOf(PIN));
+    fakeKey.signed.length = 0;
+    backend.log.length = 0;
+    const undo = tamper('stepupChallenge', patch);
+    const f = new SendTransaction(TX);
+    expect(await f.begin()).toMatchObject({ ok: false, error: { code: 'CHALLENGE_MISMATCH' } });
+    expect(f.divergence).toBe(true);
+    expect(await f.proveWithBiometric()).toMatchObject({ ok: false, error: { code: 'CHALLENGE_MISMATCH' } });
+    const pin = pinOf(PIN);
+    expect(await f.proveWithPin(pin)).toMatchObject({ ok: false, error: { code: 'CHALLENGE_MISMATCH' } });
+    expect(await f.submit()).toMatchObject({ ok: false });
+    undo();
+    expect(fakeKey.signed).toHaveLength(0);
+    expect(backend.log.filter((l) => l.op === 'stepupVerify' || l.op === 'createTransaction')).toHaveLength(0);
+    expect(pin.length).toBe(0);
+  });
+  it('biometric prompt carries the server summary title (L-11)', async () => {
+    await onboardUnlocked();
+    await enableBiometrics(pinOf(PIN));
+    fakeKey.signed.length = 0;
+    const f = new SendTransaction(TX);
+    await f.begin();
+    await f.proveWithBiometric();
+    expect(fakeKey.signed[0]!.title).toBe('Confirm: Send 1.5 ETH');
   });
 });

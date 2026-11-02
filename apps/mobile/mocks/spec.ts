@@ -101,10 +101,10 @@ export function matchOperation(method: string, pathname: string): { op: Operatio
 
 /** Schema node for a response (status) of an operation, or undefined (e.g. 204). */
 export function responseSchema(op: Operation, status: number): Json | undefined {
-  const r = op.responses[String(status)];
+  const r = op.responses[String(status)] ?? op.responses['default'];
   if (!r) return undefined;
   return deref(r).content?.['application/json']?.schema;
 }
 export function hasResponse(op: Operation, status: number): boolean {
-  return String(status) in op.responses;
+  return String(status) in op.responses || 'default' in op.responses;
 }

@@ -14,13 +14,13 @@ func TestSec66_RestartKeepsSecurityState(t *testing.T) {
 	d := bioDevice(t, e, "alice")
 
 	// consumed challenge cannot be replayed after a restart
-	c := e.bioChallenge(d.id)
+	c := e.bioChallenge(d)
 	body := map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sign(t, d.key, challengeMsg(t, c.m(), "login"))}
-	r := e.do("POST", "/v1/auth/biometric/verify", body, nil)
+	r := e.bioVerify(d, body)
 	require.Equal(t, 200, r.Status)
 	d.applySession(r.m())
 	e.restart()
-	require.Equal(t, 401, e.do("POST", "/v1/auth/biometric/verify", body, nil).Status)
+	require.Equal(t, 401, e.bioVerify(d, body).Status)
 
 	// used refresh token is still "used" after a restart; the reuse revokes the family
 	old := *d

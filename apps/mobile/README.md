@@ -16,7 +16,12 @@ Feature `biometric-pin-login`. Contract: `../../docs/features/biometric-pin-logi
 | `node scripts/check-manifest.mjs --variant production` | SEC-067/006 native config assertions after prebuild (`APP_VARIANT=production npx expo prebuild --no-install --clean` first) |
 | `pnpm --filter mobile export:release` then `check:bundle` | release bundle scan (SEC-055/016/006) |
 
+Contract v1.1: `biometric/challenge` and `biometric/verify` send the refresh token as `Authorization`; a 401 there never wipes credentials or the key; after 5 bad signatures the server suspends biometrics until the next PIN unlock and the app simply uses the PIN. The mock models this.
+
 Mock server choice: a thin `node:http` adapter over the same contract mock core (`mocks/core.ts`) that Jest drives through MSW's `getResponse` (`mocks/msw.ts`). `@mswjs/http-middleware` and `msw/node` interceptors were not used (msw 3 interceptors are ESM + wasm and do not load under Jest CJS). The mock validates every request body and (in tests) every response against the spec with ajv.
+
+## Build variant (`APP_VARIANT`)
+`APP_VARIANT` defaults to **production** (fail closed: ATS local-network exception off, cleartext rejected). Only an explicit `APP_VARIANT=development` enables the iOS local-networking exception; the `start`, `android` and `ios` scripts set it for you, and `eas.json` sets it in the `development` profile. Run `node scripts/check-manifest.mjs --variant production` after a plain `expo prebuild` to confirm.
 
 ## Running against the mock
 1. `cp .env.example .env` and set `EXPO_PUBLIC_API_URL` (`http://10.0.2.2:8080` Android emulator, `http://localhost:8080` iOS simulator, `http://<LAN-ip>:8080` device). `EXPO_PUBLIC_DEMO_SECRET` is optional, dev only, and is never bundled in release builds. `.env` is git-ignored.

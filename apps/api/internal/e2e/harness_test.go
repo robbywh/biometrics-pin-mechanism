@@ -120,7 +120,7 @@ func newEnv(t *testing.T, opts ...envOpt) *env {
 	cfg.Limits = config.Limits{DemoLoginIPMin: big, DemoLoginIPHour: big, DemoLoginGlobal: big, PinVerifyDevice: big, PinVerifyIP: big,
 		BioChallengeDevice: big, BioChallengeIP: big, BioVerifyDevice: big, BioVerifyIP: big, RefreshDevice: big, RefreshIP: big,
 		StepUpUser: big, EnrollUser: big, PinChangeUser: big, TxUser: big, GlobalIP: big, DemoBreakerOpenFor: time.Minute,
-		DeviceFailMax: 10, DeviceFailWindow: 15 * time.Minute, DeviceBlockFor: time.Hour}
+		DeviceFailMax: 8, DeviceFailWindow: time.Hour, DeviceBlockFor: time.Hour}
 	d := pg.New(t)
 	e := &env{t: t, cfg: cfg, db: d, clk: clock.NewFake(t0), logs: &syncBuf{}, audit: &syncBuf{}, hooks: &handlers.Hooks{}, hconc: 8, hwait: 10 * time.Second}
 	for _, o := range opts {
@@ -227,12 +227,7 @@ func (v *validatingTransport) validate(r *http.Request, reqBody []byte, resp *ht
 		Status:                 resp.StatusCode, Header: resp.Header, Options: opts,
 	}
 	in.SetBodyBytes(body)
-	// CONTRACT ISSUES (reported to the tech lead): the prose says a bootstrap token on any access-token endpoint is
-	// 403 SCOPE_INSUFFICIENT, but these operations do not declare a 403 response.
-	// 500 INTERNAL is in the ErrorCode enum but no operation declares a 500 response; 400 VALIDATION_ERROR is not declared on
-	// refresh/logout/listDevices/getDashboard/biometricDisable/revokeDevice/enrollChallenge (contract issues, reported).
-	undeclared := resp.StatusCode == 500 || resp.StatusCode == 400 || (strings.EqualFold(route.Operation.OperationID, "demoLogin") && resp.StatusCode == 404) || ((strings.EqualFold(route.Operation.OperationID, "logout") || strings.EqualFold(route.Operation.OperationID, "changePin")) && resp.StatusCode == 403)
-	if err := openapi3filter.ValidateResponse(r.Context(), in); err != nil && !undeclared {
+	if err := openapi3filter.ValidateResponse(r.Context(), in); err != nil {
 		v.t.Errorf("RESPONSE CONTRACT VIOLATION [%s] %s %s -> %d: %v\nbody: %.300s", route.Operation.OperationID, r.Method, r.URL.Path, resp.StatusCode, err, string(body))
 	}
 	if resp.StatusCode >= 400 && (strings.Contains(string(body), `"stack"`) || strings.Contains(strings.ToLower(string(body)), "sql") || strings.Contains(string(body), "pgx")) {
@@ -452,15 +447,22 @@ func (e *env) enableBio(d *device, pinCode string) resp {
 	return r
 }
 
-func (e *env) bioChallenge(devID string) resp {
-	return e.do("POST", "/v1/auth/biometric/challenge", map[string]string{"deviceId": devID}, nil)
+// bioChallenge / bioVerify carry the device credential (refresh token) required since contract v1.1.
+func (e *env) bioChallenge(d *device) resp {
+	return e.do("POST", "/v1/auth/biometric/challenge", map[string]string{"deviceId": d.id}, bearer(d.refresh))
+}
+
+func (e *env) bioVerify(d *device, body any) resp {
+	return e.do("POST", "/v1/auth/biometric/verify", body, bearer(d.refresh))
 }
 
 func (e *env) bioLogin(d *device) resp {
-	c := e.bioChallenge(d.id)
-	require.Equal(e.t, 200, c.Status, string(c.Body))
-	return e.do("POST", "/v1/auth/biometric/verify", map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id,
-		"signature": sign(e.t, d.key, challengeMsg(e.t, c.m(), "login"))}, nil)
+	c := e.bioChallenge(d)
+	if c.Status != 200 { // e.g. stale/revoked device credential: the whole login fails
+		return c
+	}
+	return e.bioVerify(d, map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id,
+		"signature": sign(e.t, d.key, challengeMsg(e.t, c.m(), "login"))})
 }
 
 func (e *env) count(q string, args ...any) int {

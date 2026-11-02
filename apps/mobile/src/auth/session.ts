@@ -11,6 +11,14 @@ import { setBiometricHint } from '../storage/hint';
 
 let inflightRefresh: Promise<'ok' | 'locked' | 'gone' | 'network'> | null = null;
 
+let authFailedStreak = 0;
+/** L-12: returns true when the credential should be wiped (second consecutive AUTH_FAILED without a success in between). */
+export function noteAuthFailed(): boolean {
+  authFailedStreak += 1;
+  return authFailedStreak >= 2;
+}
+export const __resetAuthFailedStreak = () => { authFailedStreak = 0; };
+
 export class SessionPersistError extends Error {}
 
 /** Locks the app: drops access + step-up tokens from memory; the refresh token stays in SecureStore. */
@@ -50,6 +58,7 @@ export async function applyServerSession(resp: api.SessionResponse, opts: { unlo
     throw new SessionPersistError('persist failed');
   }
   memory.setAccess(resp.accessToken, resp.expiresIn);
+  authFailedStreak = 0;
   const recentFailures = resp.recentFailures ?? 0;
   if (opts.unlock || authState.get().status === 'unlocked') {
     authState.__unlockFromServerSession({
@@ -79,7 +88,9 @@ async function doRefresh(): Promise<'ok' | 'locked' | 'gone' | 'network'> {
   }
   switch (r.error.code) {
     case 'UNLOCK_REQUIRED': lock(); return 'locked'; // token NOT deleted
-    case 'AUTH_FAILED': await wipeCredentials(); return 'gone'; // the ONLY wipe path
+    case 'AUTH_FAILED': // wipe only on the second consecutive AUTH_FAILED (L-12); the first just locks
+      if (noteAuthFailed()) { await wipeCredentials(); return 'gone'; }
+      lock(); return 'locked';
     case 'NETWORK_ERROR': case 'TIMEOUT': return 'network';
     default: lock(); return 'locked';
   }

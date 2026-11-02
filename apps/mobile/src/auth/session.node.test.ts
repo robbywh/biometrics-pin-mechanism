@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
 import * as api from '../api/endpoints';
 import { authState } from './state';
-import { applyServerSession, authedCall, lock, SessionPersistError } from './session';
+import { __resetAuthFailedStreak, applyServerSession, authedCall, lock, refreshSession, SessionPersistError } from './session';
 import { unlockWithBiometric, unlockWithPin } from './unlock';
 import { getRefreshToken, memory } from '../storage/secureTokens';
 import { failSecureWrites, plain, secure, secureOptions } from '../testing/fakeStorage';
@@ -13,6 +13,7 @@ import { enableBiometrics } from '../flows/biometrics';
 import { boot } from './boot';
 
 const { backend } = setupMockApi();
+beforeEach(() => __resetAuthFailedStreak());
 
 describe('storage (SEC-034, test 18/21)', () => {
   it('refresh token only in SecureStore with WHEN_PASSCODE_SET_THIS_DEVICE_ONLY; nothing sensitive in AsyncStorage', async () => {
@@ -82,6 +83,10 @@ describe('refresh policy (T8)', () => {
     memory.setAccess('expired', 0);
     backend.setScenario('refresh-reuse');
     await authedCall((t) => api.getDashboard(t));
+    // L-12: first AUTH_FAILED only locks; the second consecutive one wipes
+    expect(authState.get().status).toBe('locked');
+    expect(await getRefreshToken()).toBeTruthy();
+    await refreshSession(); // second consecutive AUTH_FAILED
     expect(authState.get().status).toBe('onboarding');
     expect(await getRefreshToken()).toBeNull();
   });

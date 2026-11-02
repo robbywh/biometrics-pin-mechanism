@@ -56,9 +56,7 @@ func TestSharedVectors(t *testing.T) {
 	require.Len(t, v.Vectors, 2)
 	for _, vec := range v.Vectors {
 		want := concatHex(t, vec.SegmentsHex)
-		if vec.Kind == "challenge-message" { // NOTE: tx-preimage-1 declares totalBytes=140 but its segments sum to 138 (contract issue, reported)
-			require.Equal(t, vec.TotalBytes, len(want), vec.ID)
-		}
+		require.Equal(t, vec.TotalBytes, len(want), vec.ID) // 147 and 138 (vectors.json fixed in contract v1.1)
 		switch vec.Kind {
 		case "challenge-message":
 			nonce, _ := hex.DecodeString(vec.Input["nonceHex"].(string))

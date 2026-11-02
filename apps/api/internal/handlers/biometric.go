@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
@@ -61,7 +62,7 @@ func (s *Server) BiometricChallenge(ctx context.Context, req apigen.BiometricCha
 	}
 	now := s.Clk.Now()
 	exp := now.Add(s.Cfg.ChallengeTTL)
-	decoy := apigen.Challenge{ChallengeId: uuid.New(), Purpose: apigen.ChallengePurposeLogin, UserId: uuid.New(), DeviceId: devID,
+	decoy := apigen.Challenge{ChallengeId: uuid.New(), Purpose: apigen.ChallengePurposeLogin, UserId: s.decoyUserID(devID), DeviceId: devID,
 		Nonce: cryptomsg.EncodeB64(randBytes(32)), ExpiresAt: exp.Unix()}
 
 	dev, err := s.St.Q.GetDeviceByID(ctx, devID)
@@ -71,9 +72,9 @@ func (s *Server) BiometricChallenge(ctx context.Context, req apigen.BiometricCha
 		}
 		return nil, s.fail(ctx, "bioChallenge", err)
 	}
-	_, kerr := s.St.Q.GetActiveKey(ctx, devID)
+	key, kerr := s.St.Q.GetActiveKey(ctx, devID)
 	u, uerr := s.St.Q.GetUserByID(ctx, dev.UserID)
-	if kerr != nil || uerr != nil || dev.RevokedAt != nil || u.HardLocked {
+	if kerr != nil || uerr != nil || dev.RevokedAt != nil || u.HardLocked || key.BioSuspendedAt != nil {
 		for _, e := range []error{kerr, uerr} {
 			if e != nil && !store.NotFound(e) {
 				return nil, s.fail(ctx, "bioChallenge", e)
@@ -100,7 +101,9 @@ func (s *Server) BiometricChallenge(ctx context.Context, req apigen.BiometricCha
 	return apigen.BiometricChallenge200JSONResponse{Body: challengeBody(ch, apigen.ChallengePurposeLogin)}, nil
 }
 
-// recordBioFailure counts a bad signature; the 5th consecutive one revokes the key (SEC-030). The PIN counter is untouched.
+// recordBioFailure counts a bad signature. The 5th consecutive one SUSPENDS biometrics for the device until the next
+// PIN unlock (ruling c / L-01): the key is not revoked, so an anonymous caller who knows a deviceId cannot destroy it.
+// The PIN counter is untouched.
 func (s *Server) recordBioFailure(ctx context.Context, key db.DeviceKey, dev db.Device) {
 	n, err := s.St.Q.RecordBioFailure(ctx, key.ID)
 	if err != nil {
@@ -111,13 +114,24 @@ func (s *Server) recordBioFailure(ctx context.Context, key db.DeviceKey, dev db.
 		return
 	}
 	now := s.Clk.Now()
-	_ = s.St.InTx(ctx, func(q *db.Queries) error {
-		if r, err := q.RevokeActiveKey(ctx, db.RevokeActiveKeyParams{DeviceID: dev.ID, RevokedAt: ptr(now), RevokeReason: ptr("bio_failures")}); err != nil || r == 0 {
-			return err
-		}
-		return q.InvalidateDeviceChallenges(ctx, db.InvalidateDeviceChallengesParams{DeviceID: dev.ID, ConsumedAt: ptr(now)})
-	})
-	s.Audit.Emit(ctx, audit.Event{Type: audit.BioKeyInvalidated, UserID: &dev.UserID, DeviceID: &dev.ID, Result: "fail", Meta: map[string]any{"reason": "bad_signatures", "fingerprint": cryptomsg.EncodeB64(key.Fingerprint)}})
+	rows, err := s.St.Q.SuspendKey(ctx, db.SuspendKeyParams{DeviceID: dev.ID, BioSuspendedAt: ptr(now)})
+	if err != nil || rows == 0 {
+		return
+	}
+	_ = s.St.Q.InvalidateDeviceChallenges(ctx, db.InvalidateDeviceChallengesParams{DeviceID: dev.ID, ConsumedAt: ptr(now)})
+	s.Audit.Emit(ctx, audit.Event{Type: audit.BioSuspended, UserID: &dev.UserID, DeviceID: &dev.ID, Result: "fail", Meta: map[string]any{"reason": "bad_signatures", "fingerprint": cryptomsg.EncodeB64(key.Fingerprint)}})
+}
+
+// decoyUserID is stable per device (HMAC), so a decoy cannot be told from a real challenge by repeating the call (L-02).
+func (s *Server) decoyUserID(dev uuid.UUID) uuid.UUID {
+	m := hmac.New(sha256.New, s.macKey)
+	m.Write([]byte("decoy-user-id-v1"))
+	m.Write(dev[:])
+	var id uuid.UUID
+	copy(id[:], m.Sum(nil))
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	return id
 }
 
 // BiometricVerify: the signature is the credential. Every failure returns the same 401 body and headers.
@@ -137,7 +151,7 @@ func (s *Server) BiometricVerify(ctx context.Context, req apigen.BiometricVerify
 	if kerr != nil && !store.NotFound(kerr) {
 		return nil, s.fail(ctx, "bioVerify", kerr)
 	}
-	haveKey := derr2 == nil && kerr == nil
+	haveKey := derr2 == nil && kerr == nil && key.BioSuspendedAt == nil
 	// Consume atomically on the first attempt (SEC-026), scoped to this device and the login purpose.
 	ch, cerr := s.St.Q.ConsumeChallenge(ctx, db.ConsumeChallengeParams{ID: b.ChallengeId, DeviceID: b.DeviceId, Purpose: "login", ConsumedAt: ptr(now)})
 	if cerr != nil && !store.NotFound(cerr) {
@@ -209,7 +223,7 @@ func (s *Server) BiometricEnrollChallenge(ctx context.Context, req apigen.Biomet
 	if herr != nil {
 		return nil, herr
 	}
-	tok, herr := requireStepUp(req.Params.XStepUpToken, "pin")
+	tok, herr := requireStepUp(derefStr(req.Params.XStepUpToken), "pin")
 	if herr != nil {
 		return nil, herr
 	}
@@ -360,6 +374,11 @@ func (s *Server) BiometricDisable(ctx context.Context, req apigen.BiometricDisab
 			return nil, s.fail(ctx, "bioDisable", err)
 		}
 		return nil, httpx.NotFound()
+	}
+	if d.ID != p.DeviceID { // L-06: stripping another device's key needs the PIN step-up of revoke_device, not a mere recent unlock
+		e := httpx.New(http.StatusForbidden, "STEPUP_REQUIRED")
+		e.Required = "pin"
+		return nil, e
 	}
 	now := s.Clk.Now()
 	if now.Sub(p.LastUnlock) > 5*time.Minute {

@@ -43,6 +43,9 @@ func TestZContractCoverage(t *testing.T) {
 	for _, item := range doc.Paths.Map() {
 		for _, op := range item.Operations() {
 			for status := range op.Responses.Map() {
+				if status == "default" {
+					continue // DefaultError: every non-listed status is validated against it by the transport
+				}
 				key := strings.ToLower(op.OperationID) + " " + status
 				if cov[key] {
 					continue

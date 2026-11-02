@@ -40,7 +40,7 @@ var erd = map[string][]string{
 	"users":               {"id", "username", "pin_hash", "pepper_version", "pin_set_at", "fail_count", "locked_until", "hard_locked", "failures_since_unlock", "last_failure_at", "cooling_off_until", "created_at"},
 	"devices":             {"id", "user_id", "platform", "name", "risk", "created_at", "last_seen_at", "cooling_off_until", "revoked_at"},
 	"device_pin_failures": {"device_id", "window_started_at", "fail_count", "blocked_until"},
-	"device_keys":         {"id", "device_id", "spki", "fingerprint", "attestation_type", "key_security_level", "bio_fail_count", "cooling_off_until", "created_at", "revoked_at", "revoke_reason"},
+	"device_keys":         {"id", "device_id", "spki", "fingerprint", "attestation_type", "key_security_level", "bio_fail_count", "cooling_off_until", "created_at", "revoked_at", "revoke_reason", "bio_suspended_at"},
 	"challenges":          {"id", "user_id", "device_id", "session_id", "purpose", "action", "nonce", "bound_hash", "required_proof", "expires_at", "consumed_at", "created_at"},
 	"sessions":            {"id", "user_id", "device_id", "family_id", "parent_id", "refresh_hash", "amr", "created_at", "last_unlock_at", "last_seen_at", "expires_at", "used_at", "revoked_at", "revoke_reason"},
 	"bootstrap_tokens":    {"token_hash", "user_id", "device_id", "scope", "expires_at", "used_at", "created_at"},
@@ -273,4 +273,20 @@ func TestNoStringBuiltSQL(t *testing.T) {
 		require.False(t, re.Match(b), p)
 		return nil
 	})
+}
+
+func TestRuntimeRoleCannotModifyAudit(t *testing.T) {
+	d := pg.New(t)
+	can, err := store.New(d.Pool).Q.CanModifyAudit(context.Background())
+	require.NoError(t, err)
+	require.False(t, can)
+}
+
+func TestSumTxByAssetEmpty(t *testing.T) {
+	d := pg.New(t)
+	s := store.New(d.Pool)
+	uid := seed(t, s, "alice")
+	rows, err := s.Q.SumTxByAsset(context.Background(), db.SumTxByAssetParams{UserID: uid, CreatedAt: t0.Add(-time.Hour), Proof: "bio"})
+	require.NoError(t, err)
+	require.Empty(t, rows)
 }

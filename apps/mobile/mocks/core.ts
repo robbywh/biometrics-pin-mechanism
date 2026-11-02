@@ -54,13 +54,15 @@ export class MockBackend {
   private challenges = new Map<string, ChallengeRec>();
   private idem = new Map<string, { hash: string; res: MockResponse }>();
   private scenarioCalls = new Map<string, number>();
+  private bioFails = new Map<string, number>();
+  private bioSuspended = new Set<string>();
   private balances = { BTC: 0.15, ETH: 1.2, USDC: 93.2 };
   /** every request seen: handy for assertions */
   readonly log: { op: string; headers: Record<string, string>; body: unknown; response?: MockResponse }[] = [];
 
   reset(): void {
     Object.assign(this, { scenario: 'happy', pin: null, failures: 0, hardLocked: false, lockedUntil: 0 });
-    this.devices.clear(); this.tokens.clear(); this.challenges.clear(); this.idem.clear(); this.scenarioCalls.clear(); this.log.length = 0;
+    this.devices.clear(); this.tokens.clear(); this.challenges.clear(); this.idem.clear(); this.scenarioCalls.clear(); this.bioFails.clear(); this.bioSuspended.clear(); this.log.length = 0;
   }
   setScenario(s: string): boolean {
     if (!(SCENARIOS as readonly string[]).includes(s)) return false;
@@ -71,6 +73,7 @@ export class MockBackend {
   }
   /** test helper: pre-seed an account that already has a PIN */
   seedPin(pin: string): void { this.pin = pin; }
+  isBioSuspended(id: string): boolean { return this.bioSuspended.has(id); }
   deviceById(id: string): DeviceRec | undefined { return this.devices.get(id); }
 
   // ---------- helpers ----------
@@ -102,6 +105,13 @@ export class MockBackend {
     const rec = t ? this.tokens.get(t) : undefined;
     if (!t || !rec || rec.kind !== 'bootstrap' || rec.used) return this.err(401, 'AUTH_FAILED');
     return { rec, token: t };
+  }
+  /** v1.1: device credential = the device's current refresh token (resolved, NOT consumed); body deviceId must match. */
+  private deviceCredentialOk(req: MockRequest, deviceId: string): boolean {
+    const t = this.bearer(req);
+    const rec = t ? this.tokens.get(t) : undefined;
+    const dev = this.devices.get(deviceId);
+    return !!rec && rec.kind === 'refresh' && !rec.used && rec.deviceId === deviceId && !!dev && !dev.revoked;
   }
   private isResp(x: unknown): x is MockResponse { return typeof x === 'object' && x !== null && 'status' in x && 'headers' in x; }
 
@@ -310,25 +320,34 @@ export class MockBackend {
         const bad = this.checkPin(body.pin);
         if (bad) return bad;
         if (rec!.kind === 'bootstrap') rec!.used = true;
+        this.bioSuspended.delete(body.deviceId);
+        this.bioFails.set(body.deviceId, 0);
         return this.json(200, this.session(body.deviceId, 'pin', failuresBefore), { 'cache-control': 'no-store' });
       }
 
       case 'biometricChallenge': {
+        if (!this.deviceCredentialOk(req, body.deviceId)) return this.err(401, 'AUTH_FAILED', {}, { 'cache-control': 'no-store' });
         const dev = this.devices.get(body.deviceId);
-        const live = dev && !dev.revoked && dev.biometricEnabled && !this.hardLocked;
+        const live = dev && !dev.revoked && dev.biometricEnabled && !this.hardLocked && !this.bioSuspended.has(body.deviceId);
         const id = randomUUID();
         if (live) this.challenges.set(id, { id, purpose: 'login', deviceId: body.deviceId, consumed: false });
         return this.json(200, { challengeId: id, purpose: 'login', userId: live ? USER_ID : randomUUID(), deviceId: body.deviceId, nonce: b64u(32), expiresAt: now + 60 }, { 'cache-control': 'no-store' });
       }
 
       case 'biometricVerify': {
+        if (!this.deviceCredentialOk(req, body.deviceId)) return this.err(401, 'AUTH_FAILED', {}, { 'cache-control': 'no-store' });
         const ch = this.challenges.get(body.challengeId);
         const sigOk = /^[A-Za-z0-9_-]+$/.test(body.signature);
-        if (!ch || ch.consumed || ch.deviceId !== body.deviceId || ch.purpose !== 'login' || !sigOk || this.hardLocked) {
+        if (!ch || ch.consumed || ch.deviceId !== body.deviceId || ch.purpose !== 'login' || !sigOk || this.hardLocked || this.bioSuspended.has(body.deviceId)) {
           if (ch) ch.consumed = true;
+          // D-19: 5 consecutive bad verifications suspend biometrics until the next PIN unlock (key stays active)
+          const n = (this.bioFails.get(body.deviceId) ?? 0) + 1;
+          this.bioFails.set(body.deviceId, n);
+          if (n >= 5) this.bioSuspended.add(body.deviceId);
           return this.err(401, 'AUTH_FAILED', {}, { 'cache-control': 'no-store' });
         }
         ch.consumed = true;
+        this.bioFails.set(body.deviceId, 0);
         return this.json(200, this.session(body.deviceId, 'bio'), { 'cache-control': 'no-store' });
       }
 
@@ -468,7 +487,8 @@ export class MockBackend {
         const a = this.access(req);
         if (this.isResp(a)) return a;
         return this.idempotent(req, `tx:${a.token}`, () => {
-          const t = req.headers['x-stepup-token']!;
+          const t = req.headers['x-stepup-token'];
+          if (!t) return this.err(403, 'STEPUP_REQUIRED', { required: 'pin' });
           const rec = this.tokens.get(t);
           if (!rec || rec.kind !== 'stepup' || rec.used || rec.deviceId !== a.rec.deviceId || rec.action !== 'transaction') return this.err(403, 'STEPUP_INVALID');
           rec.used = true;

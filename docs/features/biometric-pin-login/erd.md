@@ -67,7 +67,8 @@ erDiagram
         bytea fingerprint "first 8 bytes of SHA-256 of spki"
         text attestation_type "none or android_key or app_attest or play_integrity"
         text key_security_level "self reported and untrusted in demo"
-        smallint bio_fail_count "5 consecutive bad signatures revokes the key"
+        smallint bio_fail_count "5 consecutive bad signatures suspends biometric login"
+        timestamptz bio_suspended_at "set at 5 failures - cleared by next PIN unlock - key stays active"
         timestamptz cooling_off_until "biometric only approval disabled until then"
         timestamptz created_at
         timestamptz revoked_at
@@ -181,6 +182,7 @@ Postgres partial and composite unique constraints that Mermaid cannot show:
 - `device_keys (device_id) WHERE revoked_at IS NULL` unique (one active key per device).
 - `challenges (device_id, purpose) WHERE consumed_at IS NULL` unique (one live challenge per device and purpose; for stepup also scope by session_id).
 - `sessions (device_id) WHERE revoked_at IS NULL AND used_at IS NULL` is NOT unique (a family has one live row at a time but old rows stay); the invariant "one live family per device" is enforced in code in the unlock transaction (revoke previous family then insert).
+- `transactions (user_id, created_at)` index (SEC-069 rolling-window sums).
 - `transactions (user_id, tx_nonce)` unique; `transactions (step_up_token_hash)` unique.
 - `devices` count of active rows per user is limited to 5 in the registration transaction (`SELECT ... FOR UPDATE` on the user row).
 - `audit_events`: API role has INSERT only (no UPDATE or DELETE).

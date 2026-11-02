@@ -10,6 +10,8 @@ import (
 	"github.com/cryptoapp/api/internal/config"
 )
 
+const maxKeys = 100000
+
 type Result struct {
 	Allowed    bool
 	Limit      int
@@ -48,6 +50,16 @@ func (l *Limiter) Allow(key string, lim config.Limit) Result {
 			if now.Sub(w.start) > 2*time.Hour {
 				delete(l.m, k)
 			}
+		}
+	}
+	if len(l.m) >= maxKeys { // L-09: attacker-chosen keys cannot grow the map without bound
+		for k, w := range l.m {
+			if now.Sub(w.start) > time.Minute {
+				delete(l.m, k)
+			}
+		}
+		if len(l.m) >= maxKeys {
+			l.m = map[string]*window{}
 		}
 	}
 	w := l.m[key]

@@ -5,11 +5,12 @@ import * as api from '../api/endpoints';
 import type { ApiError } from '../api/errors';
 import type { PinBuffer } from '../pin/buffer';
 import { buildChallengeMessage } from '../crypto/messages';
+import { isValidLoginChallenge } from '../crypto/challengeCheck';
 import { base64UrlEncode } from '../crypto/base64url';
 import { getDeviceId, getRefreshToken, memory } from '../storage/secureTokens';
 import { getBiometricHint, setBiometricHint } from '../storage/hint';
 import { biometricAlias } from '../biometric/alias';
-import { applyServerSession, wipeCredentials } from './session';
+import { applyServerSession, noteAuthFailed, wipeCredentials } from './session';
 import { authState } from './state';
 
 export type PinUnlockResult = { ok: true; recentFailures: number } | { ok: false; error: ApiError };
@@ -31,7 +32,8 @@ export async function unlockWithPin(pin: PinBuffer): Promise<PinUnlockResult> {
   pin.clear();
   if (!r.ok) {
     // Credential missing/revoked -> back to onboarding. Everything else (PIN_INVALID, PIN_LOCKED, ...) is shown as-is.
-    if (r.error.code === 'AUTH_FAILED' && !useBoot) await wipeCredentials();
+    // L-12: a single 401 never wipes the identity; only a second consecutive AUTH_FAILED does.
+    if (r.error.code === 'AUTH_FAILED' && !useBoot && noteAuthFailed()) await wipeCredentials();
     return r;
   }
   const { recentFailures } = await applyServerSession(r.data);
@@ -62,8 +64,14 @@ export async function unlockWithBiometric(promptTitle = 'Unlock'): Promise<Biome
   try { has = await BiometricKey.hasKey(alias); } catch { has = false; }
   if (!has) return { status: 'fallback', reason: 'NO_KEY' };
 
-  const ch = await api.biometricChallenge(deviceId);
+  // D-18: device credential required. Any 401 here is just a biometric failure: NEVER wipe credentials or the key (L-12).
+  const credential = await getRefreshToken();
+  if (!credential) return { status: 'fallback', reason: 'NO_KEY' };
+  const ch = await api.biometricChallenge(credential, deviceId);
   if (!ch.ok) return { status: 'fallback', reason: ch.error.code === 'NETWORK_ERROR' || ch.error.code === 'TIMEOUT' ? 'NETWORK' : 'SERVER_REJECTED' };
+
+  // M-01: refuse to prompt for (and sign) a challenge that is not a login challenge for THIS device.
+  if (!isValidLoginChallenge(ch.data, deviceId)) return { status: 'fallback', reason: 'SERVER_REJECTED' };
 
   let signature: string;
   try {
@@ -88,7 +96,7 @@ export async function unlockWithBiometric(promptTitle = 'Unlock'): Promise<Biome
     return { status: 'fallback', reason: kind };
   }
 
-  const v = await api.biometricVerify({ challengeId: ch.data.challengeId, deviceId, signature });
+  const v = await api.biometricVerify(credential, { challengeId: ch.data.challengeId, deviceId, signature });
   if (!v.ok) return { status: 'fallback', reason: v.error.code === 'NETWORK_ERROR' || v.error.code === 'TIMEOUT' ? 'NETWORK' : 'SERVER_REJECTED' };
   try {
     await applyServerSession(v.data);

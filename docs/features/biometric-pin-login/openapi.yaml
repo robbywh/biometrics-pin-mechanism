@@ -3,7 +3,7 @@ openapi: 3.1.0
 # no `nullable`; optional fields are simply omitted). See decisions.md ADR-004. additionalProperties:false everywhere.
 info:
   title: Crypto app - PIN and biometric login API
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Single source of truth for client and server (monorepo: apps/mobile and apps/api both build from this file).
     Security spec: ./security-spec.md. Examples are illustrative (opaque tokens and hashes are not real values). Crypto byte layouts: ./contract-notes.md. Shared vectors: ./vectors/vectors.json.
@@ -51,6 +51,7 @@ paths:
       operationId: healthz
       summary: Liveness and fail-closed readiness (unauthenticated, no data)
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '200':
           description: Ready
           content:
@@ -81,6 +82,12 @@ paths:
               login: { value: { username: alice, secret: demo-secret-from-config, intent: login } }
               reset: { value: { username: alice, secret: demo-secret-from-config, intent: reset } }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
+        '404':
+          description: Demo mode is off (`DEMO_MODE=false`), the route does not exist (`NOT_FOUND`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
         '200':
           description: Bootstrap token issued
           headers:
@@ -118,6 +125,7 @@ paths:
             examples:
               ios: { value: { name: "Robby's iPhone", platform: ios } }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '201':
           description: Device created
           content:
@@ -148,6 +156,7 @@ paths:
       summary: List the caller's own devices
       security: [{ accessToken: [] }]
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '200':
           description: Devices
           content:
@@ -171,6 +180,7 @@ paths:
         - { $ref: '#/components/parameters/DeviceIdPath' }
         - { $ref: '#/components/parameters/StepUpToken' }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '204': { description: Revoked }
         '401': { $ref: '#/components/responses/AuthFailed' }
         '403': { $ref: '#/components/responses/StepUpRequired' }
@@ -197,6 +207,7 @@ paths:
             examples:
               ok: { value: { pin: '493017' } }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '201':
           description: PIN set; session issued (amr=pin)
           headers:
@@ -227,6 +238,8 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/ChangePinRequest' }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
+        '403': { $ref: '#/components/responses/ScopeInsufficient' }
         '200':
           description: PIN changed; session re-issued
           headers:
@@ -260,6 +273,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/SetPinRequest' }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '200':
           description: PIN reset; session issued for the registering device
           headers:
@@ -295,6 +309,7 @@ paths:
             examples:
               ok: { value: { deviceId: 2f0c9a4e-5b1d-4c6e-9a3f-7d8e1b2c3d4e, pin: '493017' } }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '200':
           description: Unlocked
           headers:
@@ -319,17 +334,25 @@ paths:
     post:
       tags: [biometric]
       operationId: biometricChallenge
-      summary: Request a login challenge (unauthenticated, non-oracular)
+      summary: Request a login challenge (device credential required, non-oracular)
       description: |
-        Always returns 200 with a well-formed challenge. For an unknown, revoked, not-enrolled or hard-locked device the nonce, challengeId and
-        userId are random decoys (not stored as live). Clients cannot tell the difference (SEC-029). One live login challenge per device.
-      security: []
+        CONTRACT CHANGE v1.1 (security review ruling c): requires the `deviceCredential` (the device's current refresh token in
+        `Authorization`), exactly like pin/verify (SEC-014). The body `deviceId` must equal the credential's device, otherwise 401
+        `AUTH_FAILED`. The credential is only resolved: it is NOT consumed, rotated or reuse-checked here (same as pin/verify).
+        This removes the anonymous case: a third party who merely knows a deviceId can neither obtain a challenge, supersede the live
+        challenge, disclose the userId, nor trigger failure counting.
+        With a valid credential the response is always a well-formed 200. If the device has no active key, biometrics are suspended
+        (SEC-030), or the user is hard locked, the nonce, challengeId and userId are decoys (userId derived stably per device, nothing stored as live).
+        Clients cannot tell the difference (SEC-029). One live login challenge per device.
+      security: [{ deviceCredential: [] }]
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/BiometricChallengeRequest' }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
         '200':
           description: Challenge
           headers:
@@ -355,17 +378,22 @@ paths:
       operationId: biometricVerify
       summary: Verify the signed challenge -> new session (amr=bio)
       description: |
-        The signature is the credential (no Authorization header). The server rebuilds the signed message from its stored challenge
-        (contract-notes.md section 1), checks device not revoked, user not hard-locked, active key, challenge live/unconsumed, signature valid.
-        Every failure mode returns the identical 401 `AUTH_FAILED` (SEC-029). Allowed during a SOFT PIN lock, refused during HARD lock.
-        5 consecutive failures per device revoke that device's biometric key (PIN counter untouched; SEC-030).
-      security: []
+        CONTRACT CHANGE v1.1 (security review ruling c): requires the `deviceCredential` (refresh token in `Authorization`) in addition
+        to the signature; the body `deviceId` must equal the credential's device. The credential is resolved without side effects (not
+        consumed or rotated). The server rebuilds the signed message from its stored challenge (contract-notes.md section 1), checks device
+        not revoked, user not hard-locked, active key, biometrics not suspended, challenge live/unconsumed, signature valid.
+        Every failure mode (including a missing or bad credential) returns the identical 401 `AUTH_FAILED` (SEC-029). Allowed during a
+        SOFT PIN lock, refused during HARD lock. 5 consecutive failures per device SUSPEND biometric login for that device until the
+        next successful PIN unlock (the key is NOT revoked, PIN counter untouched, audit event `BIO_SUSPENDED`; SEC-030 as amended).
+        Success creates a new session family (the presented refresh token is replaced by the one in the response).
+      security: [{ deviceCredential: [] }]
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/BiometricVerifyRequest' }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '200':
           description: Unlocked
           headers:
@@ -390,6 +418,7 @@ paths:
         Limits: absolute lifetime 30 d, idle 7 d. 6/min/device. `amr` and `auth_time` of the new access token are inherited from the session.
       security: [{ deviceCredential: [] }]
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '200':
           description: New access token and rotated refresh token
           headers:
@@ -414,8 +443,10 @@ paths:
       summary: Revoke the current session and refresh family
       security: [{ accessToken: [] }]
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '204': { description: Logged out }
         '401': { $ref: '#/components/responses/AuthFailed' }
+        '403': { $ref: '#/components/responses/ScopeInsufficient' }
 
   /devices/{deviceId}/biometric/enroll/challenge:
     post:
@@ -430,8 +461,9 @@ paths:
       security: [{ accessToken: [] }]
       parameters:
         - { $ref: '#/components/parameters/DeviceIdPath' }
-        - { $ref: '#/components/parameters/StepUpTokenRequired' }
+        - { $ref: '#/components/parameters/StepUpToken' }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '200':
           description: Enroll challenge (purpose `enroll`)
           headers:
@@ -464,6 +496,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/BiometricEnrollRequest' }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '201':
           description: Key active
           content:
@@ -501,6 +534,7 @@ paths:
       parameters:
         - { $ref: '#/components/parameters/DeviceIdPath' }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '204': { description: Disabled }
         '401': { $ref: '#/components/responses/AuthFailed' }
         '403': { $ref: '#/components/responses/StepUpRequired' }
@@ -534,6 +568,7 @@ paths:
                   tx: { asset: ETH, network: ethereum, destination: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1.5', fee: '0.001', txNonce: 33333333-3333-4333-8333-333333333333, expiry: 1767225900 }
               enable: { value: { action: enable_biometric, targetDeviceId: 2f0c9a4e-5b1d-4c6e-9a3f-7d8e1b2c3d4e } }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '200':
           description: Step-up challenge
           headers:
@@ -565,6 +600,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/StepUpVerifyRequest' }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '200':
           description: Step-up token
           headers:
@@ -592,13 +628,14 @@ paths:
       security: [{ accessToken: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
-        - { $ref: '#/components/parameters/StepUpTokenRequired' }
+        - { $ref: '#/components/parameters/StepUpToken' }
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/TransactionFields' }
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '202':
           description: Accepted (mock)
           content:
@@ -633,6 +670,7 @@ paths:
       summary: Mock balances (access token required; bootstrap token gets 403)
       security: [{ accessToken: [] }]
       responses:
+        default: { $ref: '#/components/responses/DefaultError' }
         '200':
           description: Mock portfolio
           headers:
@@ -669,7 +707,7 @@ components:
       type: http
       scheme: bearer
       bearerFormat: opaque (256-bit, base64url)
-      description: The device's current refresh token, or a device-bound bootstrap token with scope pin-verify (pin/verify only).
+      description: The device's current refresh token (pin/verify, biometric/challenge, biometric/verify, refresh), or a device-bound bootstrap token with scope pin-verify (pin/verify only). Resolved without side effects except on /auth/refresh.
 
   headers:
     CacheControlNoStore:
@@ -707,14 +745,12 @@ components:
       name: X-StepUp-Token
       in: header
       required: false
-      description: Single-use step-up token from /stepup/verify. Header only (never query).
-      schema: { $ref: '#/components/schemas/OpaqueToken' }
-    StepUpTokenRequired:
-      name: X-StepUp-Token
-      in: header
-      required: true
-      description: Single-use step-up token from /stepup/verify. Header only (never query).
-      schema: { $ref: '#/components/schemas/OpaqueToken' }
+      description: |
+        Single-use step-up token from /stepup/verify. Header only (never query). Declared optional in the schema so that the SERVER decides
+        the status: on operations that need it (POST /transactions, biometric enroll/challenge, DELETE /devices/{id} for another device) a
+        missing header returns 403 STEPUP_REQUIRED and an unknown, used, expired or mismatched token returns 403 STEPUP_INVALID (never 400).
+        Malformed format (not matching OpaqueToken) is treated as invalid: 403 STEPUP_INVALID.
+      schema: { type: string, maxLength: 512 }
 
   responses:
     ValidationError:
@@ -821,6 +857,16 @@ components:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
           examples:
             limited: { value: { error: { code: RATE_LIMITED, message: Too many requests., retryAfter: 12 } } }
+    DefaultError:
+      description: |
+        Shared fallback referenced by every operation as `default`, so any error status is declared: 400 `VALIDATION_ERROR`,
+        403 (`STEPUP_REQUIRED`, `STEPUP_INVALID`, `SCOPE_INSUFFICIENT`, `COOLING_OFF`), 404 `NOT_FOUND`, 500 `INTERNAL`, 503 `SERVICE_UNAVAILABLE`.
+        The body is always the uniform ErrorResponse.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            internal: { value: { error: { code: INTERNAL, message: Something went wrong. } } }
     ServiceUnavailable:
       description: Fail-closed (misconfiguration or store unreachable). `SERVICE_UNAVAILABLE`, never defaults to open.
       content:

@@ -5,6 +5,7 @@ import * as api from '../api/endpoints';
 import { keepIdempotencyKeyAfter, newIdempotencyKey } from '../api/uuid';
 import { base64UrlEncode } from '../crypto/base64url';
 import { buildChallengeMessage, computeTxHash } from '../crypto/messages';
+import { isValidStepUpChallenge } from '../crypto/challengeCheck';
 import type { PinBuffer } from '../pin/buffer';
 import { authedCall } from '../auth/session';
 import { authState } from '../auth/state';
@@ -37,8 +38,13 @@ export class SendTransaction {
     this.stepUpToken = null;
     const r = await authedCall((t) => api.stepupChallengeTx(t, this.tx));
     if (!r.ok) return r;
+    // M-01 / M-02: the server's challenge must be a step-up for THIS device bound to the hash of the fields WE froze.
+    let local: string | null = null;
+    try { local = computeTxHash(this.tx); } catch { local = null; }
+    const s = authState.get().session;
+    this.divergence = local === null || !s || r.data.txHash !== local || !isValidStepUpChallenge(r.data, s.deviceId, local);
+    if (this.divergence) { this.challenge = null; return { ok: false, error: { code: 'CHALLENGE_MISMATCH' } }; }
     this.challenge = r.data;
-    try { this.divergence = r.data.txHash !== undefined && computeTxHash(this.tx) !== r.data.txHash; } catch { this.divergence = true; }
     return { ok: true, data: r.data };
   }
 
@@ -46,12 +52,13 @@ export class SendTransaction {
   async proveWithBiometric(): Promise<SendResult<{ fallbackToPin: boolean }>> {
     const c = this.challenge;
     const s = authState.get().session;
+    if (this.divergence) return { ok: false, error: { code: 'CHALLENGE_MISMATCH' } };
     if (!c || !s) return { ok: false, error: { code: 'NO_SESSION' } };
     if (c.required === 'pin') return { ok: true, data: { fallbackToPin: true } };
     let signature: string;
     try {
       const message = buildChallengeMessage({ purpose: c.purpose, userId: c.userId, deviceId: c.deviceId, nonce: c.nonce, expiresAt: c.expiresAt, boundHash: c.boundHash });
-      signature = (await BiometricKey.sign(biometricAlias(s.deviceId), base64UrlEncode(message), 'Confirm transaction')).signature;
+      signature = (await BiometricKey.sign(biometricAlias(s.deviceId), base64UrlEncode(message), `Confirm: ${c.summary.title}`.slice(0, 80) /* L-11: prompt carries tx context */)).signature;
     } catch {
       return { ok: true, data: { fallbackToPin: true } }; // challenge not consumed server-side yet: PIN can still use it
     }
@@ -67,6 +74,7 @@ export class SendTransaction {
 
   async proveWithPin(pin: PinBuffer): Promise<SendResult> {
     const c = this.challenge;
+    if (this.divergence) { pin.clear(); return { ok: false, error: { code: 'CHALLENGE_MISMATCH' } }; }
     if (!c) { pin.clear(); return { ok: false, error: { code: 'STEPUP_INVALID', status: 403 }, restart: true }; }
     const v = await authedCall((t) => api.stepupVerifyPin(t, c.challengeId, pin), { retry: false });
     pin.clear();

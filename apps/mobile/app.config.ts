@@ -1,7 +1,7 @@
 import type { ExpoConfig } from 'expo/config';
 
-// APP_VARIANT: development | preview | production. Only `development` may talk cleartext to localhost (SEC-006).
-const variant = process.env.APP_VARIANT ?? 'development';
+// APP_VARIANT: development | preview | production. Defaults to production (fail closed). Only an explicit `development` may talk cleartext to localhost (SEC-006).
+const variant = process.env.APP_VARIANT ?? 'production';
 const isDev = variant === 'development';
 
 const config: ExpoConfig = {

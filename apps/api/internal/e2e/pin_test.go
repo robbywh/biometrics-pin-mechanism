@@ -59,7 +59,7 @@ func TestSec7_01_ParallelGuessesAtMostFiveEvaluated(t *testing.T) {
 
 // spec s7 test 2 + the schedule table: lock escalation, correct PIN during lock, expiry and reset.
 func TestSec7_02_LockScheduleAndCorrectPinDuringLock(t *testing.T) {
-	e := newEnv(t)
+	e := newEnv(t, func(c *config.Config) { c.Limits.DeviceFailMax = 1000 }) // this test walks the user schedule up to the hard lock
 	d := e.onboard("alice", goodPIN)
 	for i := 1; i <= 4; i++ {
 		r := e.verifyPin(d, otherPIN)

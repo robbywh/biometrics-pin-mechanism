@@ -152,9 +152,9 @@ func (s *Server) ListDevices(ctx context.Context, _ apigen.ListDevicesRequestObj
 	return apigen.ListDevices200JSONResponse(out), nil
 }
 
-// requireStepUp validates presence of the step-up header (missing/placeholder => 403 STEPUP_REQUIRED).
+// requireStepUp validates presence of the step-up header (missing => 403 STEPUP_REQUIRED).
 func requireStepUp(tok string, required string) (string, *httpx.Error) {
-	if tok == "" || tok == MissingStepUp {
+	if tok == "" {
 		e := httpx.New(http.StatusForbidden, "STEPUP_REQUIRED")
 		e.Required = required
 		return "", e
@@ -227,4 +227,11 @@ func (s *Server) RevokeDevice(ctx context.Context, req apigen.RevokeDeviceReques
 		s.Audit.Emit(ctx, audit.Event{Type: audit.DeviceRevoked, UserID: &p.UserID, DeviceID: &id, Meta: map[string]any{"reason": map[bool]string{true: "other", false: "current"}[other]}})
 	}
 	return apigen.RevokeDevice204Response{}, nil
+}
+
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }

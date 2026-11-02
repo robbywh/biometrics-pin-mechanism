@@ -223,7 +223,7 @@ func (s *Server) ResetPin(ctx context.Context, req apigen.ResetPinRequestObject)
 		return nil, auth403()
 	}
 	httpx.InfoFrom(ctx).SetActor(p.UserID.String(), p.DeviceID.String())
-	if herr := s.limit(ctx, "pinchange-user", p.UserID.String(), s.Cfg.Limits.PinChangeUser, true); herr != nil {
+	if herr := s.limit(ctx, "pinreset-user", p.UserID.String(), s.Cfg.Limits.PinChangeUser, true); herr != nil {
 		return nil, herr
 	}
 	if pin.Validate(newPin) != nil {

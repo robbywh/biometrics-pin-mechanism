@@ -160,9 +160,11 @@ sequenceDiagram
     participant S as API
     participant D as DB
     A->>A: Locked, hint true and local key exists
-    A->>S: POST /auth/biometric/challenge deviceId
-    S->>D: Look up device and active key
-    alt unknown or revoked or not enrolled or hard locked
+    A->>S: POST /auth/biometric/challenge deviceId, Authorization is the refresh token
+    S->>D: Resolve device credential, look up device and active key
+    alt invalid credential or deviceId mismatch
+        S-->>A: 401 AUTH_FAILED
+    else unknown or revoked or not enrolled or suspended or hard locked
         S-->>A: 200 decoy challenge, random ids and nonce, nothing stored
     else enrolled
         S->>D: Store login challenge, supersede older one
@@ -181,11 +183,11 @@ sequenceDiagram
         Note over A,S: After PIN unlock the app calls DELETE /devices/id/biometric, see diagram 8
     else signed
         K-->>A: DER signature
-        A->>S: POST /auth/biometric/verify challengeId deviceId signature
+        A->>S: POST /auth/biometric/verify challengeId deviceId signature, Authorization is the refresh token
         S->>D: Consume challenge atomically, first attempt
         S->>S: Rebuild message from stored challenge, verify with active key
         alt any failure including replay and expiry and unknown device
-            S->>D: Increment device bio failures, revoke key at 5
+            S->>D: Increment device bio failures, suspend biometrics until next PIN unlock at 5
             S-->>A: 401 AUTH_FAILED, identical body for all failures
             A->>U: Show PIN screen
         else hard locked user

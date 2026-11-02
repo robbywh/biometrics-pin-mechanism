@@ -4,7 +4,8 @@ import * as api from '../api/endpoints';
 import type { ApiError } from '../api/errors';
 import { newIdempotencyKey } from '../api/uuid';
 import { base64UrlEncode } from '../crypto/base64url';
-import { buildChallengeMessage } from '../crypto/messages';
+import { buildChallengeMessage, computeActionHash } from '../crypto/messages';
+import { isValidEnrollChallenge } from '../crypto/challengeCheck';
 import type { PinBuffer } from '../pin/buffer';
 import { authedCall } from '../auth/session';
 import { authState } from '../auth/state';
@@ -17,7 +18,8 @@ export type FlowError =
   | { code: 'BIO_UNAVAILABLE'; reason: string }
   | { code: 'BIO_KEY_ERROR'; kind: BiometricKey.BiometricKeyErrorKind }
   | { code: 'NO_SESSION' }
-  | { code: 'REAUTH_REQUIRED' };
+  | { code: 'REAUTH_REQUIRED' }
+  | { code: 'CHALLENGE_MISMATCH' };
 export type FlowResult = { ok: true } | { ok: false; error: FlowError };
 
 const deviceIdOrNull = () => authState.get().session?.deviceId ?? null;
@@ -39,6 +41,7 @@ export async function enableBiometrics(pin: PinBuffer): Promise<FlowResult> {
   // 1) step-up with PIN (60 s TTLs: STEPUP_INVALID surfaces as "try again")
   const ch = await authedCall((t) => api.stepupChallengeTarget(t, 'enable_biometric', deviceId));
   if (!ch.ok) { pin.clear(); return ch; }
+  if (ch.data.deviceId !== deviceId || ch.data.boundHash !== computeActionHash('enable_biometric', deviceId)) { pin.clear(); return { ok: false, error: { code: 'CHALLENGE_MISMATCH' } }; }
   const sv = await authedCall((t) => api.stepupVerifyPin(t, ch.data.challengeId, pin), { retry: false });
   pin.clear();
   if (!sv.ok) return sv;
@@ -48,6 +51,8 @@ export async function enableBiometrics(pin: PinBuffer): Promise<FlowResult> {
   const stepUp = memory.takeStepUp()!;
   const ec = await authedCall((t) => api.biometricEnrollChallenge(t, deviceId, stepUp), { retry: false });
   if (!ec.ok) return ec;
+
+  if (!isValidEnrollChallenge(ec.data, deviceId)) return { ok: false, error: { code: 'CHALLENGE_MISMATCH' } }; // M-01: nothing created yet
 
   // 3) generate the key and prove possession with it (biometric prompt)
   const alias = biometricAlias(deviceId);

@@ -18,7 +18,7 @@ func validator(t testing.TB) http.Handler {
 	}
 	b := &builder{router: r}
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	return httpx.BodyLimit(MaxBody)(stepUpPlaceholder(b.validate(ok)))
+	return httpx.BodyLimit(MaxBody)(b.validate(ok))
 }
 
 const (
@@ -75,8 +75,8 @@ func TestRequestValidationTable(t *testing.T) {
 		{"amount leading zero", req("POST", "/v1/stepup/challenge", `{"action":"transaction","tx":`+strings.Replace(txJSON, `"1.5"`, `"01"`, 1)+`}`), 400},
 		{"amount as number", req("POST", "/v1/stepup/challenge", `{"action":"transaction","tx":`+strings.Replace(txJSON, `"1.5"`, `1.5`, 1)+`}`), 400},
 		{"destination with injection", req("POST", "/v1/stepup/challenge", `{"action":"transaction","tx":`+strings.Replace(txJSON, `0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`, `0x'; DROP TABLE users;--aaaaaaaaaaaaaaaaaa`, 1)+`}`), 400},
-		{"transaction missing step-up header gets placeholder", req("POST", "/v1/transactions", txJSON, idem...), 204},
-		{"transaction bad step-up token shape", req("POST", "/v1/transactions", txJSON, "Idempotency-Key", uuid4, "X-StepUp-Token", "short"), 400},
+		{"transaction without step-up header is valid (optional; the handler answers 403)", req("POST", "/v1/transactions", txJSON, idem...), 204},
+		{"transaction malformed step-up token passes validation (handler answers 403 STEPUP_INVALID)", req("POST", "/v1/transactions", txJSON, "Idempotency-Key", uuid4, "X-StepUp-Token", "short"), 204},
 		{"wrong content type", func() *http.Request {
 			r := req("POST", "/v1/pin", `{"pin":"493017"}`, idem...)
 			r.Header.Set("Content-Type", "text/plain")

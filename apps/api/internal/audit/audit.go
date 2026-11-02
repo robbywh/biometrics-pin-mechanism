@@ -33,9 +33,10 @@ const (
 	PinUnlockedAfterLock = "PIN_UNLOCKED_AFTER_LOCK"
 	BioEnrolled          = "BIO_ENROLLED"
 	BioDisabled          = "BIO_DISABLED"
-	BioKeyInvalidated    = "BIO_KEY_INVALIDATED"
+	BioSuspended         = "BIO_SUSPENDED"
 	BioVerifyFail        = "BIO_VERIFY_FAIL"
 	LoginOK              = "LOGIN_OK"
+	LoginFail            = "LOGIN_FAIL"
 	RefreshReuse         = "REFRESH_REUSE"
 	DeviceAdded          = "DEVICE_ADDED"
 	DeviceRevoked        = "DEVICE_REVOKED"
@@ -49,7 +50,7 @@ const (
 
 // AllTypes lists every event type (coverage table test).
 var AllTypes = []string{PinSet, PinChanged, PinReset, PinVerifyFail, PinLocked, PinHardLocked, PinUnlockedAfterLock, BioEnrolled,
-	BioDisabled, BioKeyInvalidated, BioVerifyFail, LoginOK, RefreshReuse, DeviceAdded, DeviceRevoked, DeviceBlocked, StepUpOK,
+	BioDisabled, BioSuspended, BioVerifyFail, LoginOK, LoginFail, RefreshReuse, DeviceAdded, DeviceRevoked, DeviceBlocked, StepUpOK,
 	StepUpFail, TxCreated, CoolingOffStarted, RateLimited}
 
 var validType = func() map[string]bool {

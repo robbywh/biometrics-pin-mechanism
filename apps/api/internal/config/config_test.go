@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -55,8 +56,9 @@ func TestFailClosed(t *testing.T) {
 		"prod without sslmode":   {"ENV": "prod", "DEMO_MODE": "false", "DATABASE_URL": "postgres://u:p@h/x", "ARGON2_MEMORY_KIB": "65536", "ARGON2_TIME": "3"},
 		"argon2 below floor":     {"ARGON2_MEMORY_KIB": "1024"},
 		"prod argon2 demo floor": {"ENV": "prod", "DEMO_MODE": "false", "DATABASE_URL": "postgres://u:p@h/x?sslmode=require"},
-		"access ttl too long":    {"ACCESS_TTL": "3600"},
-		"bootstrap ttl too long": {"BOOTSTRAP_TTL": "6000"},
+		"prod listening on all interfaces without proxy": {"ENV": "prod", "DEMO_MODE": "false", "DEMO_SECRETS": "-", "LISTEN_ADDR": "0.0.0.0:8080", "DATABASE_URL": "postgres://u:p@h/x?sslmode=require", "ARGON2_MEMORY_KIB": "65536", "ARGON2_TIME": "3"},
+		"access ttl too long":                            {"ACCESS_TTL": "3600"},
+		"bootstrap ttl too long":                         {"BOOTSTRAP_TTL": "6000"},
 	} {
 		c, err := Load(env(over))
 		require.Error(t, err, name)
@@ -112,7 +114,8 @@ func TestDefaultLimitsMatchSEC057(t *testing.T) {
 	require.Equal(t, 5, l.EnrollUser.N)
 	require.Equal(t, 5, l.PinChangeUser.N)
 	require.Equal(t, 20, l.TxUser.N)
-	require.Equal(t, 10, l.DeviceFailMax)
+	require.Equal(t, 8, l.DeviceFailMax)
+	require.Equal(t, time.Hour, l.DeviceFailWindow)
 }
 
 func TestPepperFromFile(t *testing.T) {
@@ -124,4 +127,20 @@ func TestPepperFromFile(t *testing.T) {
 	_, err = Load(env(map[string]string{"PEPPER": "-", "PEPPER_FILE": f + ".missing"}))
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), f, "paths are not echoed either")
+}
+
+func TestListenAddrGuard(t *testing.T) {
+	require.True(t, IsLoopback("127.0.0.1:8080"))
+	require.True(t, IsLoopback("[::1]:8080"))
+	require.True(t, IsLoopback("localhost:8080"))
+	require.False(t, IsLoopback("0.0.0.0:8080"))
+	require.False(t, IsLoopback("192.168.1.5:8080"))
+	require.False(t, IsLoopback(":8080"))
+	prod := map[string]string{"ENV": "prod", "DEMO_MODE": "false", "DEMO_SECRETS": "-", "DATABASE_URL": "postgres://u:p@h/x?sslmode=require", "ARGON2_MEMORY_KIB": "65536", "ARGON2_TIME": "3"}
+	prod["LISTEN_ADDR"], prod["TRUSTED_PROXY"] = "0.0.0.0:8080", "true"
+	_, err := Load(env(prod))
+	require.NoError(t, err, "behind a TLS-terminating proxy")
+	c, err := Load(env(nil))
+	require.NoError(t, err)
+	require.Equal(t, "127.0.0.1:8080", c.ListenAddr, "default is loopback")
 }

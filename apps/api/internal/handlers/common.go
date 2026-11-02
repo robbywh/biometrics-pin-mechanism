@@ -32,10 +32,6 @@ import (
 	"github.com/cryptoapp/api/internal/store/db"
 )
 
-// MissingStepUp is the placeholder the router injects when X-StepUp-Token is absent so that the contract's
-// 403 STEPUP_REQUIRED (not a 400) is returned after authentication. It is not a valid token shape for lookups.
-const MissingStepUp = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-
 // Hooks are test seams (fault injection).
 type Hooks struct {
 	AfterStepUpConsume func() error

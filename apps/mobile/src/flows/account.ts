@@ -54,10 +54,20 @@ export async function revokeOtherDevice(targetDeviceId: string, pin: PinBuffer):
   return { ok: true };
 }
 
-/** Sign out: revoke the session server-side (best effort), then drop the local key, hint and credentials. */
-export async function signOut(): Promise<void> {
+/**
+ * Sign out of THIS device (M-03): DELETE /devices/{current} revokes sessions, the biometric key and challenges atomically.
+ * If that fails (offline etc.) fall back to /auth/logout; either way the local key, hint and credentials are wiped.
+ * Returns whether the device record was revoked server-side (false => it stays listed until revoked from another device).
+ */
+export async function signOut(): Promise<{ deviceRevoked: boolean }> {
   const s = authState.get().session;
-  await authedCall((t) => api.logout(t)).catch(() => undefined);
-  if (s) await BiometricKey.deleteKey(biometricAlias(s.deviceId)).catch(() => undefined);
+  let deviceRevoked = false;
+  if (s) {
+    const r = await authedCall((t) => api.revokeDevice(t, s.deviceId)).catch(() => null);
+    deviceRevoked = !!r && (r.ok || r.error.code === 'NOT_FOUND');
+    if (!deviceRevoked) await authedCall((t) => api.logout(t)).catch(() => undefined);
+    await BiometricKey.deleteKey(biometricAlias(s.deviceId)).catch(() => undefined);
+  }
   await wipeCredentials();
+  return { deviceRevoked };
 }

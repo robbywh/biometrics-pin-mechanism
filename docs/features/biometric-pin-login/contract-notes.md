@@ -63,7 +63,7 @@ Decimal normalisation (`amountNorm`, `feeNorm`): input matches `^(0|[1-9][0-9]{0
 Destination: regex `^[A-Za-z0-9]{26,90}$`; case is significant and the server does not fold it (EIP-55 checksums stay intact). Asset/network pairs allowed: BTC/bitcoin, ETH/ethereum, USDC/ethereum. `expiry` must be within (now, now+600 s].
 Both `/stepup/challenge` and `/transactions` normalise independently and must produce identical bytes.
 
-Worked tx pre-image (140 bytes) is in `vectors/vectors.json` (`tx-preimage-1`): asset `ETH`, network `ethereum`, destination `0x` + 40 x `a`, amount `1.5` (also test input `1.50`), fee `0.001`, txNonce `33333333-3333-4333-8333-333333333333`, expiry `1700000600`.
+Worked tx pre-image (138 bytes: 2+15, 2+3, 2+8, 2+42, 2+3, 2+5, 2+36, 2+10) is in `vectors/vectors.json` (`tx-preimage-1`): asset `ETH`, network `ethereum`, destination `0x` + 40 x `a`, amount `1.5` (also test input `1.50`), fee `0.001`, txNonce `33333333-3333-4333-8333-333333333333`, expiry `1700000600`.
 
 ## 3. Non-transaction action hash (enable_biometric, revoke_device)
 
@@ -88,12 +88,21 @@ Refresh failure modes: `AUTH_FAILED` (unknown/used/revoked/expired -> family rev
 
 1. First run: `demo-login(login)` -> `POST /devices` -> `POST /pin` -> session. Store refresh token. Store deviceId (non-secret) in AsyncStorage or SecureStore.
 2. PIN unlock: `POST /auth/pin/verify` with `Authorization: Bearer <refresh token>`.
-3. Biometric unlock: `/auth/biometric/challenge` -> sign (biometric prompt) -> `/auth/biometric/verify`.
+3. Biometric unlock (v1.1): `/auth/biometric/challenge` -> sign (biometric prompt) -> `/auth/biometric/verify`; BOTH calls carry `Authorization: Bearer <refresh token>` (device credential, resolved without side effects) and a `deviceId` equal to the credential's device.
 4. Auto-lock return: try `/auth/refresh` (works only inside the unlock window) else unlock via 2 or 3.
 5. Enable biometrics: `/stepup/challenge {enable_biometric}` -> `/stepup/verify {pin}` -> `/devices/{id}/biometric/enroll/challenge` (consumes step-up token) -> generate key + sign enroll challenge -> `/devices/{id}/biometric/enroll`.
 6. Transaction: `/stepup/challenge {transaction}` -> show `summary` -> `/stepup/verify {signature|pin}` -> `/transactions` with `X-StepUp-Token` + `Idempotency-Key` + same fields.
 7. Reset PIN / hard lock: `demo-login(reset)` -> `POST /devices` (new device id) -> `POST /pin/reset`. All old devices are revoked; discard the old deviceId and local key; re-enroll biometrics.
 8. Key invalidated: delete local key -> PIN unlock -> `DELETE /devices/{id}/biometric`.
+9. Sign out (user-facing, SEC-069 rule): `DELETE /devices/{currentDeviceId}` (revokes device, sessions, biometric key, challenges), then wipe local credentials and key. `POST /auth/logout` only ends the current session and refresh family (lock or end-session semantics) and does not free the device slot or revoke the key.
+
+## 8. Changes in contract v1.1 (security review amendments)
+
+- `X-StepUp-Token` is optional in the schema everywhere; the server answers 403 `STEPUP_REQUIRED` (absent) or 403 `STEPUP_INVALID` (anything else wrong), never 400.
+- Every operation has a `default` response (`DefaultError`) so 400, 403, 404, 500, 503 are always declared. Logout and changePin declare 403 `SCOPE_INSUFFICIENT`; demoLogin declares 404 `NOT_FOUND` when `DEMO_MODE` is off.
+- `/auth/biometric/challenge` and `/auth/biometric/verify` now require the device credential (refresh token). Five consecutive bad signatures SUSPEND biometric login for the device until the next successful PIN unlock; the key is not revoked.
+- The decoy challenge `userId` is derived stably per device (HMAC of deviceId with a server key, formatted as a UUID), so repeated calls cannot distinguish real from decoy.
+- `tx-preimage-1` is 138 bytes (was misstated as 140).
 
 ## 6. Shared test vectors (`vectors/vectors.json`)
 

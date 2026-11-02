@@ -97,13 +97,22 @@ func (s *Server) StepupChallenge(ctx context.Context, req apigen.StepupChallenge
 		}
 		cooling, until := s.coolingActive(u, dev, key, now)
 		if cooling && usd.Cmp(s.Cfg.CoolingOffMax) > 0 {
-			e := httpx.New(http.StatusForbidden, "COOLING_OFF")
-			e.RetryAfter = ptr(int(until.Sub(now).Seconds() + 0.999))
-			return nil, e
+			return nil, coolingOffErr(until, now)
+		}
+		if cooling { // aggregate over the rolling window (H-01); re-checked under the user lock at submit time
+			if herr, err := s.coolingAggregate(ctx, s.St.Q, p.UserID, usd, until, now); err != nil {
+				return nil, s.fail(ctx, "stepupChallenge", err)
+			} else if herr != nil {
+				return nil, herr
+			}
+		}
+		overAgg, err := s.bioOverAggregate(ctx, s.St.Q, p.UserID, usd, now)
+		if err != nil {
+			return nil, s.fail(ctx, "stepupChallenge", err)
 		}
 		keyCool := key != nil && key.CoolingOffUntil != nil && key.CoolingOffUntil.After(now)
 		required = stepup.RequiredForTx(stepup.Policy{KeyPresent: key != nil, KeyInCoolingOff: keyCool,
-			AttestationNone: key != nil && key.AttestationType == "none", Prod: s.Cfg.Env == "prod", OverBioMax: usd.Cmp(s.Cfg.BioOnlyMax) > 0})
+			AttestationNone: key != nil && key.AttestationType == "none", Prod: s.Cfg.Env == "prod", OverBioMax: usd.Cmp(s.Cfg.BioOnlyMax) > 0 || overAgg})
 		bound, txHash = h, h
 		amt, _ := cryptomsg.NormalizeDecimal(f.Amount)
 		fee, _ := cryptomsg.NormalizeDecimal(f.Fee)
@@ -231,10 +240,14 @@ func (s *Server) StepupVerify(ctx context.Context, req apigen.StepupVerifyReques
 	} else {
 		key, kerr := s.St.Q.GetActiveKey(ctx, p.DeviceID)
 		sig, derr := cryptomsg.DecodeB64(sigB64)
-		if kerr != nil || derr != nil {
+		if kerr != nil || derr != nil || key.BioSuspendedAt != nil {
 			if kerr != nil && !store.NotFound(kerr) {
 				return nil, s.fail(ctx, "stepupVerify", kerr)
 			}
+			burnVerify()
+			return nil, httpx.AuthFailed()
+		}
+		if st, err := s.St.Q.GetLockState(ctx, p.UserID); err != nil || st.HardLocked { // L-05: no biometric proofs while hard locked
 			burnVerify()
 			return nil, httpx.AuthFailed()
 		}

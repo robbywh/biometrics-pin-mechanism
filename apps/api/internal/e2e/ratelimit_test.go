@@ -81,24 +81,25 @@ func TestSec7_13_BiometricLimits(t *testing.T) {
 	e := newEnv(t, func(c *config.Config) { c.Limits.BioChallengeDevice = lim(3); c.Limits.BioVerifyDevice = lim(3) })
 	d := bioDevice(t, e, "alice")
 	for i := 0; i < 3; i++ {
-		require.Equal(t, 200, e.bioChallenge(d.id).Status)
+		require.Equal(t, 200, e.bioChallenge(d).Status)
 	}
-	require429(t, e.bioChallenge(d.id), "challenge per device")
+	require429(t, e.bioChallenge(d), "challenge per device")
 	body := map[string]any{"challengeId": "7b1f0f3e-8d2a-4b53-a1c4-5e6f7a8b9c0d", "deviceId": d.id, "signature": "AAAA"}
 	for i := 0; i < 3; i++ {
-		require.Equal(t, 401, e.do("POST", "/v1/auth/biometric/verify", body, nil).Status)
+		require.Equal(t, 401, e.bioVerify(d, body).Status)
 	}
-	require429(t, e.do("POST", "/v1/auth/biometric/verify", body, nil), "verify per device")
+	require429(t, e.bioVerify(d, body), "verify per device")
 
 	ip := newEnv(t, func(c *config.Config) { c.Limits.BioChallengeIP = lim(2); c.Limits.BioVerifyIP = lim(2) })
+	di := ip.onboard("alice", goodPIN)
 	for i := 0; i < 2; i++ {
-		require.Equal(t, 200, ip.bioChallenge("99999999-9999-4999-8999-999999999999").Status)
+		require.Equal(t, 200, ip.bioChallenge(di).Status)
 	}
-	require429(t, ip.bioChallenge("99999999-9999-4999-8999-999999999999"), "challenge per IP")
+	require429(t, ip.bioChallenge(di), "challenge per IP")
 	for i := 0; i < 2; i++ {
-		require.Equal(t, 401, ip.do("POST", "/v1/auth/biometric/verify", body, nil).Status)
+		require.Equal(t, 401, ip.bioVerify(di, body).Status)
 	}
-	require429(t, ip.do("POST", "/v1/auth/biometric/verify", body, nil), "verify per IP")
+	require429(t, ip.bioVerify(di, body), "verify per IP")
 }
 
 func TestSec7_13_RefreshStepUpEnrollPinTxLimits(t *testing.T) {

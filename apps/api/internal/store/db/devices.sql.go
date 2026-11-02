@@ -35,7 +35,7 @@ func (q *Queries) CountAllDevices(ctx context.Context, userID uuid.UUID) (int64,
 }
 
 const getActiveKey = `-- name: GetActiveKey :one
-SELECT id, device_id, spki, fingerprint, attestation_type, key_security_level, bio_fail_count, cooling_off_until, created_at, revoked_at, revoke_reason FROM device_keys WHERE device_id = $1 AND revoked_at IS NULL
+SELECT id, device_id, spki, fingerprint, attestation_type, key_security_level, bio_fail_count, cooling_off_until, created_at, revoked_at, revoke_reason, bio_suspended_at FROM device_keys WHERE device_id = $1 AND revoked_at IS NULL
 `
 
 func (q *Queries) GetActiveKey(ctx context.Context, deviceID uuid.UUID) (DeviceKey, error) {
@@ -53,6 +53,7 @@ func (q *Queries) GetActiveKey(ctx context.Context, deviceID uuid.UUID) (DeviceK
 		&i.CreatedAt,
 		&i.RevokedAt,
 		&i.RevokeReason,
+		&i.BioSuspendedAt,
 	)
 	return i, err
 }
@@ -165,7 +166,7 @@ func (q *Queries) InsertDevice(ctx context.Context, arg InsertDeviceParams) (Dev
 const insertDeviceKey = `-- name: InsertDeviceKey :one
 INSERT INTO device_keys (id, device_id, spki, fingerprint, attestation_type, key_security_level, cooling_off_until, created_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, device_id, spki, fingerprint, attestation_type, key_security_level, bio_fail_count, cooling_off_until, created_at, revoked_at, revoke_reason
+RETURNING id, device_id, spki, fingerprint, attestation_type, key_security_level, bio_fail_count, cooling_off_until, created_at, revoked_at, revoke_reason, bio_suspended_at
 `
 
 type InsertDeviceKeyParams struct {
@@ -203,6 +204,7 @@ func (q *Queries) InsertDeviceKey(ctx context.Context, arg InsertDeviceKeyParams
 		&i.CreatedAt,
 		&i.RevokedAt,
 		&i.RevokeReason,
+		&i.BioSuspendedAt,
 	)
 	return i, err
 }
@@ -406,6 +408,23 @@ func (q *Queries) RevokeOtherDevices(ctx context.Context, arg RevokeOtherDevices
 	return err
 }
 
+const suspendKey = `-- name: SuspendKey :execrows
+UPDATE device_keys SET bio_suspended_at = $2 WHERE device_id = $1 AND revoked_at IS NULL AND bio_suspended_at IS NULL
+`
+
+type SuspendKeyParams struct {
+	DeviceID       uuid.UUID
+	BioSuspendedAt *time.Time
+}
+
+func (q *Queries) SuspendKey(ctx context.Context, arg SuspendKeyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, suspendKey, arg.DeviceID, arg.BioSuspendedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const touchDevice = `-- name: TouchDevice :exec
 UPDATE devices SET last_seen_at = $2 WHERE id = $1
 `
@@ -417,6 +436,15 @@ type TouchDeviceParams struct {
 
 func (q *Queries) TouchDevice(ctx context.Context, arg TouchDeviceParams) error {
 	_, err := q.db.Exec(ctx, touchDevice, arg.ID, arg.LastSeenAt)
+	return err
+}
+
+const unsuspendKey = `-- name: UnsuspendKey :exec
+UPDATE device_keys SET bio_suspended_at = NULL, bio_fail_count = 0 WHERE device_id = $1 AND revoked_at IS NULL
+`
+
+func (q *Queries) UnsuspendKey(ctx context.Context, deviceID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, unsuspendKey, deviceID)
 	return err
 }
 

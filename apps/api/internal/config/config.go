@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net"
 	"os"
 	"sort"
 	"strconv"
@@ -57,7 +58,7 @@ func DefaultLimits() Limits {
 		StepUpUser: Limit{10, m}, EnrollUser: Limit{5, h}, PinChangeUser: Limit{5, h}, TxUser: Limit{20, m},
 		GlobalIP:           Limit{600, m},
 		DemoBreakerOpenFor: time.Minute,
-		DeviceFailMax:      10, DeviceFailWindow: 15 * m, DeviceBlockFor: h,
+		DeviceFailMax:      8, DeviceFailWindow: h, DeviceBlockFor: h, // ruling (b): reachable with the default lock schedule
 	}
 }
 
@@ -88,6 +89,9 @@ type Config struct {
 	BioOnlyMax         *big.Rat // mock USD
 	CoolingOffDuration time.Duration
 	CoolingOffMax      *big.Rat
+	CoolingOffMaxTx    int                 // max transactions inside one cooling-off window (H-01)
+	CoolingOffWindow   time.Duration       // SEC-069 rolling window for the cooling-off aggregate
+	BioOnlyWindow      time.Duration       // SEC-069 rolling window for biometric-approved value
 	Prices             map[string]*big.Rat // asset -> mock USD price
 
 	TrustedProxy bool
@@ -275,6 +279,12 @@ func Load(get Getenv) (*Config, error) {
 	c.BioOnlyMax = rat("BIO_ONLY_MAX", "1000")
 	c.CoolingOffMax = rat("COOLING_OFF_MAX", "500")
 	c.CoolingOffDuration = secs("COOLING_OFF_DURATION", 86400)
+	c.CoolingOffMaxTx = num("COOLING_OFF_MAX_TX", 5)
+	c.CoolingOffWindow = secs("COOLING_OFF_WINDOW", int(c.CoolingOffDuration.Seconds()))
+	c.BioOnlyWindow = secs("BIO_ONLY_WINDOW", 86400)
+	if c.CoolingOffMaxTx < 1 || c.BioOnlyWindow < time.Minute || c.CoolingOffWindow < time.Minute {
+		fail("COOLING_OFF_MAX_TX / COOLING_OFF_WINDOW / BIO_ONLY_WINDOW out of range")
+	}
 	c.Prices = map[string]*big.Rat{}
 	for _, pair := range strings.Split(str("MOCK_PRICES", "BTC=65000,ETH=2500,USDC=1"), ",") {
 		a, p, ok := strings.Cut(strings.TrimSpace(pair), "=")
@@ -292,6 +302,10 @@ func Load(get Getenv) (*Config, error) {
 		}
 	}
 	c.TrustedProxy = boolean("TRUSTED_PROXY")
+	// M-05: no TLS listener exists. Production must sit behind a TLS-terminating proxy or listen on loopback only.
+	if c.Env == "prod" && !c.TrustedProxy && !IsLoopback(c.ListenAddr) {
+		fail("ENV=prod needs TRUSTED_PROXY=true (TLS-terminating proxy) or a loopback LISTEN_ADDR")
+	}
 	c.AuditChain = boolean("AUDIT_HASH_CHAIN")
 
 	if len(errs) > 0 {
@@ -325,3 +339,16 @@ func decodeB64(s string) ([]byte, error) {
 
 // copyForTest returns a shallow copy (tests dump a value, not a pointer).
 func (c *Config) copyForTest() *Config { cp := *c; return &cp }
+
+// IsLoopback reports whether a listen address binds loopback only.
+func IsLoopback(addr string) bool {
+	h, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}

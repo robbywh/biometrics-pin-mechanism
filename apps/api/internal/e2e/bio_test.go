@@ -45,46 +45,73 @@ func TestSec7_06_ReplayConcurrentExpiredPurposeConfusion(t *testing.T) {
 	e := newEnv(t)
 	d := bioDevice(t, e, "alice")
 
-	// replay of a captured verify body
-	c := e.bioChallenge(d.id)
+	// replay of a captured verify body (the replayer holds the device's CURRENT refresh token)
+	c := e.bioChallenge(d)
 	body := map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sign(t, d.key, challengeMsg(t, c.m(), "login"))}
-	require.Equal(t, 200, e.do("POST", "/v1/auth/biometric/verify", body, nil).Status)
-	r := e.do("POST", "/v1/auth/biometric/verify", body, nil)
+	first := e.bioVerify(d, body)
+	require.Equal(t, 200, first.Status)
+	d.applySession(first.m())
+	r := e.bioVerify(d, body)
 	require.Equal(t, 401, r.Status)
 	require.Equal(t, "AUTH_FAILED", r.code())
 
 	// concurrent double verify of one nonce => exactly one 200
-	c = e.bioChallenge(d.id)
+	c = e.bioChallenge(d)
 	body = map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sign(t, d.key, challengeMsg(t, c.m(), "login"))}
 	var wg sync.WaitGroup
 	var ok atomic.Int64
+	var win sync.Map
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if e.do("POST", "/v1/auth/biometric/verify", body, nil).Status == 200 {
+			if r := e.bioVerify(d, body); r.Status == 200 {
 				ok.Add(1)
+				win.Store("m", r.m())
 			}
 		}()
 	}
 	wg.Wait()
 	require.EqualValues(t, 1, ok.Load())
+	m, _ := win.Load("m")
+	d.applySession(m.(map[string]any))
 
 	// expired nonce
-	c = e.bioChallenge(d.id)
+	c = e.bioChallenge(d)
 	sig := sign(t, d.key, challengeMsg(t, c.m(), "login"))
 	e.clk.Advance(61 * time.Second)
-	r = e.do("POST", "/v1/auth/biometric/verify", map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sig}, nil)
+	r = e.bioVerify(d, map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sig})
 	require.Equal(t, 401, r.Status)
 
 	// a signature made for purpose "stepup" or "enroll" does not log in
 	for _, purpose := range []string{"stepup", "enroll"} {
-		c = e.bioChallenge(d.id)
+		c = e.bioChallenge(d)
 		sig = sign(t, d.key, challengeMsg(t, c.m(), purpose))
-		r = e.do("POST", "/v1/auth/biometric/verify", map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sig}, nil)
+		r = e.bioVerify(d, map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sig})
 		require.Equal(t, 401, r.Status, purpose)
 	}
 }
+
+// Contract v1.1 (D-18): without the device credential, or with another device's, challenge and verify give the uniform 401.
+func TestD18_BiometricEndpointsRequireDeviceCredential(t *testing.T) {
+	e := newEnv(t)
+	a := bioDevice(t, e, "alice")
+	b := bioDevice(t, e, "bob")
+	for name, h := range map[string]map[string]string{"none": nil, "garbage": bearer("nope"), "access token": bearer(a.access), "other user's refresh": bearer(b.refresh)} {
+		r := e.do("POST", "/v1/auth/biometric/challenge", map[string]string{"deviceId": a.id}, h)
+		require.Equal(t, 401, r.Status, name)
+		require.Equal(t, "AUTH_FAILED", r.code(), name)
+		r = e.do("POST", "/v1/auth/biometric/verify", map[string]any{"challengeId": uuidStr, "deviceId": a.id, "signature": "AAAA"}, h)
+		require.Equal(t, 401, r.Status, name)
+	}
+	require.Equal(t, 0, e.count("SELECT count(*) FROM challenges WHERE purpose='login' AND consumed_at IS NULL AND device_id=$1::uuid", a.id), "an anonymous caller cannot create or supersede challenges")
+	require.Equal(t, 0, e.count("SELECT bio_fail_count FROM device_keys WHERE device_id=$1::uuid", a.id), "and cannot count failures")
+	// the credential is resolved without side effects: still usable as refresh token afterwards
+	e.bioChallenge(a)
+	require.Equal(t, 200, e.refresh(a).Status)
+}
+
+const uuidStr = "7b1f0f3e-8d2a-4b53-a1c4-5e6f7a8b9c0d"
 
 // Login signature must not satisfy a step-up verification (domain separation, SEC-027/043).
 func TestSec7_06_LoginSignatureFailsAsStepUp(t *testing.T) {
@@ -126,30 +153,30 @@ func TestSec7_06_FailureModesAreByteIdentical(t *testing.T) {
 		if k != nil && c != nil {
 			sig = sign(t, k, challengeMsg(t, c, "login"))
 		}
-		return e.do("POST", "/v1/auth/biometric/verify", map[string]any{"challengeId": chal, "deviceId": devID, "signature": sig}, nil)
+		return e.bioVerify(d, map[string]any{"challengeId": chal, "deviceId": devID, "signature": sig})
 	}
 	var outs []outcome
 	// bad signature
-	c := e.bioChallenge(d.id)
+	c := e.bioChallenge(d)
 	outs = append(outs, norm(verify(d.id, c.m()["challengeId"].(string), other, c.m())))
 	// replayed
-	c = e.bioChallenge(d.id)
+	c = e.bioChallenge(d)
 	good := verify(d.id, c.m()["challengeId"].(string), d.key, c.m())
 	require.Equal(t, 200, good.Status)
 	d.applySession(good.m())
 	outs = append(outs, norm(verify(d.id, c.m()["challengeId"].(string), d.key, c.m())))
 	// expired
-	c = e.bioChallenge(d.id)
+	c = e.bioChallenge(d)
 	e.clk.Advance(2 * time.Minute)
 	outs = append(outs, norm(verify(d.id, c.m()["challengeId"].(string), d.key, c.m())))
 	// no challenge at all
 	outs = append(outs, norm(verify(d.id, "7b1f0f3e-8d2a-4b53-a1c4-5e6f7a8b9c0d", d.key, c.m())))
-	// unknown device (decoy challenge)
-	dc := e.bioChallenge("99999999-9999-4999-8999-999999999999")
-	require.Equal(t, 200, dc.Status)
-	outs = append(outs, norm(verify("99999999-9999-4999-8999-999999999999", dc.m()["challengeId"].(string), d.key, dc.m())))
+	// device id that does not belong to the presented credential (unknown device)
+	outs = append(outs, norm(verify("99999999-9999-4999-8999-999999999999", "7b1f0f3e-8d2a-4b53-a1c4-5e6f7a8b9c0d", d.key, c.m())))
+	// suspended-by-failures key path is covered in TestSec30; hard-locked user:
+	_ = 0
 	// revoked key (disable biometrics, then try with the old key on a leftover challenge)
-	c = e.bioChallenge(d.id)
+	c = e.bioChallenge(d)
 	e.unlock(d, goodPIN)
 	require.Equal(t, 204, e.do("DELETE", "/v1/devices/"+d.id+"/biometric", nil, bearer(d.access)).Status)
 	outs = append(outs, norm(verify(d.id, c.m()["challengeId"].(string), d.key, c.m())))
@@ -159,12 +186,14 @@ func TestSec7_06_FailureModesAreByteIdentical(t *testing.T) {
 	require.Contains(t, outs[0].body, `"code":"AUTH_FAILED"`)
 }
 
-// Decoy challenge is indistinguishable in shape and headers from a real one, and nothing is stored for it.
+// Decoy challenge (not enrolled / suspended / hard locked) is indistinguishable in shape and headers from a real one.
 func TestSec7_06_DecoyChallengeShape(t *testing.T) {
 	e := newEnv(t)
 	d := bioDevice(t, e, "alice")
-	real := e.bioChallenge(d.id)
-	decoy := e.bioChallenge("99999999-9999-4999-8999-999999999999")
+	real := e.bioChallenge(d)
+	d2 := e.onboard("bob", goodPIN) // not enrolled => decoy
+	decoy := e.bioChallenge(d2)
+	require.Equal(t, 200, decoy.Status)
 	var k1, k2 []string
 	for k := range real.m() {
 		k1 = append(k1, k)
@@ -176,29 +205,59 @@ func TestSec7_06_DecoyChallengeShape(t *testing.T) {
 	sort.Strings(k2)
 	require.Equal(t, k1, k2)
 	require.Equal(t, real.Header.Get("Cache-Control"), decoy.Header.Get("Cache-Control"))
-	require.Equal(t, "99999999-9999-4999-8999-999999999999", decoy.m()["deviceId"], "decoy echoes the requested device id")
-	require.Equal(t, 1, e.count("SELECT count(*) FROM challenges WHERE consumed_at IS NULL AND purpose='login'"))
-	// a not-enrolled device also gets a decoy
-	d2 := e.onboard("bob", goodPIN)
-	nr := e.bioChallenge(d2.id)
-	require.Equal(t, 200, nr.Status)
-	require.Equal(t, 1, e.count("SELECT count(*) FROM challenges WHERE consumed_at IS NULL AND purpose='login'"))
+	require.Equal(t, d2.id, decoy.m()["deviceId"], "decoy echoes the device id")
+	require.Equal(t, 1, e.count("SELECT count(*) FROM challenges WHERE consumed_at IS NULL AND purpose='login'"), "nothing stored for the decoy")
+	// L-02: the decoy userId is stable per device (HMAC), so calling twice reveals nothing; and it is not the real user id
+	again := e.bioChallenge(d2)
+	require.Equal(t, decoy.m()["userId"], again.m()["userId"])
+	require.NotEqual(t, decoy.m()["nonce"], again.m()["nonce"])
+	require.NotEqual(t, d2.userID, decoy.m()["userId"])
+	require.Equal(t, real.m()["userId"], e.bioChallenge(d).m()["userId"], "real challenge userId is stable too")
 }
 
-// SEC-030: 5 consecutive bad signatures revoke the key; the PIN counter is untouched; a valid signature then fails.
-func TestSec30_FiveBadSignaturesRevokeKey(t *testing.T) {
+// SEC-030 / D-19: 5 consecutive bad signatures SUSPEND biometrics (key kept) until the next PIN unlock.
+func TestSec30_FiveBadSignaturesSuspendKeyUntilPinUnlock(t *testing.T) {
 	e := newEnv(t)
 	d := bioDevice(t, e, "alice")
 	wrong, _ := newKey(t)
 	for i := 0; i < 5; i++ {
-		c := e.bioChallenge(d.id)
-		r := e.do("POST", "/v1/auth/biometric/verify", map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sign(t, wrong, challengeMsg(t, c.m(), "login"))}, nil)
+		c := e.bioChallenge(d)
+		r := e.bioVerify(d, map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sign(t, wrong, challengeMsg(t, c.m(), "login"))})
 		require.Equal(t, 401, r.Status)
 	}
 	require.Equal(t, 0, e.failCount("alice"))
-	require.Equal(t, 0, e.count("SELECT count(*) FROM device_keys WHERE revoked_at IS NULL AND device_id=$1::uuid", d.id))
-	require.Equal(t, 401, e.bioLogin(d).Status)
-	require.Equal(t, 1, e.count("SELECT count(*) FROM audit_events WHERE event_type='BIO_KEY_INVALIDATED'"))
+	require.Equal(t, 1, e.count("SELECT count(*) FROM device_keys WHERE revoked_at IS NULL AND bio_suspended_at IS NOT NULL AND device_id=$1::uuid", d.id), "key kept, suspended")
+	require.Equal(t, 401, e.bioLogin(d).Status, "a valid signature is refused while suspended")
+	require.Equal(t, 1, e.count("SELECT count(*) FROM audit_events WHERE event_type='BIO_SUSPENDED'"))
+	// the decoy path is taken for a suspended key (no live login challenge is stored)
+	before := e.count("SELECT count(*) FROM challenges WHERE consumed_at IS NULL AND purpose='login'")
+	e.bioChallenge(d)
+	require.Equal(t, before, e.count("SELECT count(*) FROM challenges WHERE consumed_at IS NULL AND purpose='login'"))
+	// PIN unlock lifts the suspension; the key was never revoked, no re-enrolment
+	e.unlock(d, goodPIN)
+	r := e.bioLogin(d)
+	require.Equal(t, 200, r.Status, string(r.Body))
+	require.Equal(t, 1, e.count("SELECT count(*) FROM device_keys WHERE device_id=$1::uuid", d.id))
+}
+
+// L-05 / L-06
+func TestL05_L06_HardLockBioStepUpAndDisableOtherDevice(t *testing.T) {
+	e := newEnv(t, func(c *configT) { c.LockSchedule = [5]int{1, 1, 1, 1, 1}; c.Limits.DeviceFailMax = 1000 })
+	a := bioDevice(t, e, "alice")
+	b := e.addDevice("alice", goodPIN, "tab")
+	r := e.do("DELETE", "/v1/devices/"+b.id+"/biometric", nil, bearer(a.access))
+	require.Equal(t, 403, r.Status, "another device's key needs the PIN step-up route")
+	require.Equal(t, "STEPUP_REQUIRED", r.code())
+	e.clk.Advance(25 * time.Hour)
+	e.unlock(a, goodPIN)
+	c := e.do("POST", "/v1/stepup/challenge", map[string]any{"action": "transaction", "tx": e.txBody("0.1")}, bearer(a.access))
+	require.Equal(t, "either", c.m()["required"])
+	for i := 0; i < 10; i++ {
+		e.do("POST", "/v1/auth/pin/verify", map[string]string{"deviceId": b.id, "pin": otherPIN}, bearer(b.refresh))
+		e.clk.Advance(2 * time.Second)
+	}
+	v := e.do("POST", "/v1/stepup/verify", map[string]any{"challengeId": c.m()["challengeId"], "signature": sign(t, a.key, challengeMsg(t, c.m(), "stepup"))}, bearer(a.access))
+	require.Equal(t, 401, v.Status, string(v.Body))
 }
 
 // A success resets the consecutive-failure counter.
@@ -208,10 +267,12 @@ func TestSec30_SuccessResetsFailureCounter(t *testing.T) {
 	wrong, _ := newKey(t)
 	for round := 0; round < 3; round++ {
 		for i := 0; i < 4; i++ {
-			c := e.bioChallenge(d.id)
-			e.do("POST", "/v1/auth/biometric/verify", map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sign(t, wrong, challengeMsg(t, c.m(), "login"))}, nil)
+			c := e.bioChallenge(d)
+			e.bioVerify(d, map[string]any{"challengeId": c.m()["challengeId"], "deviceId": d.id, "signature": sign(t, wrong, challengeMsg(t, c.m(), "login"))})
 		}
-		require.Equal(t, 200, e.bioLogin(d).Status)
+		r := e.bioLogin(d)
+		require.Equal(t, 200, r.Status)
+		d.applySession(r.m())
 	}
 }
 
@@ -235,7 +296,7 @@ func TestSec7_05_HardLockBlocksPinAndBiometric_ResetRecovers(t *testing.T) {
 	require.Equal(t, 423, r.Status)
 	require.Equal(t, "hard", r.errField("lockType"))
 	require.Equal(t, 401, e.bioLogin(d).Status, "hard lock refuses biometric login")
-	dc := e.bioChallenge(d.id) // decoy for a hard-locked user
+	dc := e.bioChallenge(d) // decoy for a hard-locked user
 	require.Equal(t, 200, dc.Status)
 
 	// recovery: demo-login(reset) -> new device -> reset
@@ -289,6 +350,9 @@ func TestSec7_07_EnrollmentRequirements(t *testing.T) {
 	ch := e.do("POST", "/v1/devices/"+d.id+"/biometric/enroll/challenge", nil, h)
 	require.Equal(t, 200, ch.Status, string(ch.Body))
 	require.Equal(t, "enroll", ch.m()["purpose"])
+	short := e.do("POST", "/v1/devices/"+d.id+"/biometric/enroll/challenge", nil, merge(bearer(d.access), map[string]string{"X-StepUp-Token": "short"}))
+	require.Equal(t, 403, short.Status, "malformed step-up token is STEPUP_INVALID, not a validation error (D-21)")
+	require.Equal(t, "STEPUP_INVALID", short.code())
 	replay := e.do("POST", "/v1/devices/"+d.id+"/biometric/enroll/challenge", nil, h)
 	require.Equal(t, 403, replay.Status)
 	require.Equal(t, "STEPUP_INVALID", replay.code())

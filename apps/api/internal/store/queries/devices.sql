@@ -71,3 +71,9 @@ UPDATE devices SET risk = $3, last_seen_at = $4 WHERE id = $1 AND user_id = $2;
 
 -- name: CountAllDevices :one
 SELECT count(*) FROM devices WHERE user_id = $1;
+
+-- name: SuspendKey :execrows
+UPDATE device_keys SET bio_suspended_at = $2 WHERE device_id = $1 AND revoked_at IS NULL AND bio_suspended_at IS NULL;
+
+-- name: UnsuspendKey :exec
+UPDATE device_keys SET bio_suspended_at = NULL, bio_fail_count = 0 WHERE device_id = $1 AND revoked_at IS NULL;

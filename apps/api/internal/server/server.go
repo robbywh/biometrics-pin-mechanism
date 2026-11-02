@@ -116,7 +116,7 @@ func New(o Options) (*App, error) {
 	api.MethodNotAllowed(nf)
 
 	root := chi.NewRouter()
-	root.Use(httpx.Base(o.Log, o.Cfg.TrustedProxy), httpx.BodyLimit(MaxBody), b.ipLimits, stepUpPlaceholder, b.validate)
+	root.Use(httpx.Base(o.Log, o.Cfg.TrustedProxy), b.requireHTTPSInProd, httpx.BodyLimit(MaxBody), b.ipLimits, b.validate)
 	root.Handle("/v1/*", api)
 	root.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		r2 := r.Clone(r.Context())
@@ -144,6 +144,17 @@ func validatorRouter() (routers.Router, error) {
 		}
 	}
 	return legacy.NewRouter(vdoc)
+}
+
+// requireHTTPSInProd (M-05): with ENV=prod the server only trusts a TLS-terminating proxy; plain-HTTP requests are refused.
+func (b *builder) requireHTTPSInProd(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if b.o.Cfg.Env == "prod" && r.TLS == nil && !(b.o.Cfg.TrustedProxy && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")) {
+			httpx.Validation().Write(w)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // routeCapture records the matched route template for the request log after the handler returns.
@@ -177,18 +188,6 @@ func (b *builder) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	b.o.Log.ErrorContext(r.Context(), "unhandled error", "component", "http", "err_class", "unhandled")
 	httpx.Internal().Write(w)
-}
-
-// stepUpPlaceholder makes an absent X-StepUp-Token reach the handler (403 STEPUP_REQUIRED after authentication)
-// instead of failing contract validation with 400.
-func stepUpPlaceholder(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.Header.Get("X-StepUp-Token") == "" &&
-			(r.URL.Path == "/v1/transactions" || (strings.HasPrefix(r.URL.Path, "/v1/devices/") && strings.HasSuffix(r.URL.Path, "/biometric/enroll/challenge"))) {
-			r.Header.Set("X-StepUp-Token", handlers.MissingStepUp)
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 // validate checks every request against the canonical OpenAPI document (types, patterns, enums, additionalProperties,
@@ -249,12 +248,13 @@ func (b *builder) ipLimits(next http.Handler) http.Handler {
 		if r.Method == http.MethodPost {
 			switch r.URL.Path {
 			case "/v1/auth/demo-login":
+				// Per-IP rules FIRST: only requests that passed them feed the global breaker (M-04), so one IP cannot open it for everyone.
+				if !check("demo-ip-min", l.DemoLoginIPMin, true) || !check("demo-ip-hour", l.DemoLoginIPHour, false) {
+					return
+				}
 				if br := b.lim.Breaker(l.DemoLoginGlobal, l.DemoBreakerOpenFor); !br.Allowed {
 					b.aw.Emit(ctx, audit.Event{Type: audit.RateLimited, Result: "fail", Meta: map[string]any{"limit_class": "demo-breaker"}})
 					httpx.RateLimited(br.RetryAfter, &httpx.RateInfo{Limit: br.Limit, Remaining: 0, Reset: br.ResetSec}).Write(w)
-					return
-				}
-				if !check("demo-ip-min", l.DemoLoginIPMin, true) || !check("demo-ip-hour", l.DemoLoginIPHour, false) {
 					return
 				}
 			case "/v1/auth/pin/verify":
@@ -286,7 +286,7 @@ func (b *builder) authMiddleware(next apigen.StrictHandlerFunc, op string) apige
 		var p *auth.Principal
 		var herr *httpx.Error
 		switch op {
-		case "Healthz", "DemoLogin", "BiometricChallenge", "BiometricVerify":
+		case "Healthz", "DemoLogin":
 		case "RegisterDevice":
 			p, herr = b.auth.Bootstrap(ctx, tok, "pin-setup", "pin-verify", "pin-reset")
 		case "SetPin":
@@ -295,6 +295,18 @@ func (b *builder) authMiddleware(next apigen.StrictHandlerFunc, op string) apige
 			p, herr = b.auth.Bootstrap(ctx, tok, "pin-reset")
 		case "VerifyPin":
 			rq, _ := req.(apigen.VerifyPinRequestObject)
+			if rq.Body == nil {
+				return nil, httpx.Validation()
+			}
+			p, herr = b.auth.DeviceCredential(ctx, tok, uuid.UUID(rq.Body.DeviceId))
+		case "BiometricChallenge": // contract v1.1 (D-18): device credential required, no side effects on the token
+			rq, _ := req.(apigen.BiometricChallengeRequestObject)
+			if rq.Body == nil {
+				return nil, httpx.Validation()
+			}
+			p, herr = b.auth.DeviceCredential(ctx, tok, uuid.UUID(rq.Body.DeviceId))
+		case "BiometricVerify":
+			rq, _ := req.(apigen.BiometricVerifyRequestObject)
 			if rq.Body == nil {
 				return nil, httpx.Validation()
 			}

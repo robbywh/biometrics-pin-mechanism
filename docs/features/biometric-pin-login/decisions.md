@@ -58,8 +58,15 @@ Artifacts: [draft](./draft.md), [security-spec](./security-spec.md), [openapi.ya
 - **D-11 Cooling-off defaults.** Config `COOLING_OFF_DURATION` 24 h (demo may set minutes), `COOLING_OFF_MAX` and `BIO_ONLY_MAX` mock-USD thresholds from config. Started by reset, new device (not the first), new biometric enrollment.
 - **D-12 Rate limits (SEC-057), in-memory buckets.** demo-login 5/min/IP + 20/h/IP + global breaker; pin/verify 10/min/device + 30/min/IP; biometric challenge and verify 10/min/device + 30/min/IP; refresh 6/min/device; stepup challenge+verify 10/min/user; enroll 5/h/user; PUT /pin and /pin/reset 5/h/user; transactions 20/min/user. 429 with `Retry-After`; `RateLimit-*` headers.
 - **D-13 Extra error codes beyond SEC-059** (stable, in the `ErrorCode` enum): `STEPUP_INVALID` 403, `SCOPE_INSUFFICIENT` 403 (bootstrap token on dashboard), `DEVICE_LIMIT` 409, `NOT_FOUND` 404, `PIN_WEAK` 422, `PIN_UNCHANGED` 422, `IDEMPOTENCY_KEY_REUSED` 422, `INVALID_PUBLIC_KEY` 422, `INSUFFICIENT_FUNDS` 422, `SERVICE_UNAVAILABLE` 503, `INTERNAL` 500, `PIN_ALREADY_SET`, `IDEMPOTENT_REPLAY`, `COOLING_OFF`.
-- **D-14 ESCALATION: spec inconsistency SEC-020 vs SEC-040.** SEC-020 says a replayed step-up token at enrollment yields 401; SEC-040 says reuse yields 403. Chosen: 403 `STEPUP_INVALID` for every step-up token misuse (reuse, expired, other session/device/action, hash mismatch) and 403 `STEPUP_REQUIRED` when missing; 401 `AUTH_FAILED` stays for a bad proof-of-possession signature. Security-specialist to confirm or overrule; this changes only status codes in openapi.yaml and two tests.
+- **D-14 (CONFIRMED by security review ruling a) spec inconsistency SEC-020 vs SEC-040.** SEC-020 says a replayed step-up token at enrollment yields 401; SEC-040 says reuse yields 403. Chosen: 403 `STEPUP_INVALID` for every step-up token misuse (reuse, expired, other session/device/action, hash mismatch) and 403 `STEPUP_REQUIRED` when missing; 401 `AUTH_FAILED` stays for a bad proof-of-possession signature. Security-specialist to confirm or overrule; this changes only status codes in openapi.yaml and two tests.
 - **D-15 Spec housekeeping.** There are 67 SEC identifiers: 001-006, 005b, 008-057, 059-068. SEC-007 and SEC-058 do not exist in the spec (SEC-058 is cited in threat T1 but never defined; the intent is presumably rate limiting, which SEC-057 covers). The brief's "66 requirements" is off by one (67 ids are present, counting 005b); the table below lists all 67. Security-specialist to confirm no requirement is missing under 007/058.
+- **D-18 CONTRACT CHANGE v1.1 (both engineers, from security review ruling c): biometric challenge and verify require the device credential.** `POST /auth/biometric/challenge` and `POST /auth/biometric/verify` now take `Authorization: Bearer <refresh token>` (security `deviceCredential`) and the body `deviceId` must equal the credential's device (else uniform 401 `AUTH_FAILED`). The credential is resolved without side effects (not consumed, rotated or reuse-checked), like pin/verify. Effects: removes anonymous challenge supersede and userId disclosure (L-01, L-02); the decoy `userId` is derived stably per device (HMAC of deviceId). Backend: add `ResolveDeviceCredential` to both handlers (tasks T14). Expo: send the refresh token on both calls (tasks T14); on 401 treat as any biometric failure (PIN screen) but do NOT wipe credentials on a single 401 (L-12). Existing code that calls these endpoints without Authorization must be updated.
+- **D-19 SEC-030 amended: suspend, not revoke.** Five consecutive bad biometric signatures suspend biometric login for the device until the next successful PIN unlock (new column `device_keys.bio_suspended_at`, see erd.md). The key stays active and no re-enrollment is forced. Audit `BIO_SUSPENDED`. While suspended, challenge returns a decoy and verify returns the uniform 401. Backend T14 and T15 statements updated.
+- **D-20 SEC-009 amended (review ruling b).** Per-device counter counts evaluated wrong PINs only: 8 within 60 minutes blocks the device from pin/verify for 1 h (or alert-only if the engineer prefers, documented). Lock-refused attempts (423 without evaluation) are neither counted nor blocking, only audited. The user counter and device credential remain the real controls.
+- **D-21 Step-up token optional in the schema; shared default error.** `X-StepUp-Token` is `required: false` on `POST /transactions`, enroll challenge and device revoke; missing gives 403 `STEPUP_REQUIRED`, any other problem 403 `STEPUP_INVALID` (this removes the placeholder-header hack, L-10). Every operation now declares `default: DefaultError` (400, 403, 404, 500, 503 with the uniform `ErrorResponse`), so response validation must not exempt undeclared statuses. Logout and changePin declare 403 `SCOPE_INSUFFICIENT`; demoLogin declares 404 `NOT_FOUND` when `DEMO_MODE` is off. OpenAPI version bumped to 1.1.0.
+- **D-22 Sign-out rule (review ruling e, SEC-036 amendment).** User-facing Sign out calls `DELETE /devices/{current}` then wipes local credentials and key; `/auth/logout` stays end-session only. No contract change. Expo T18 statement updated.
+- **D-23 SEC-069 added (review H-01).** Rolling-window cumulative limits for cooling-off and bio-only (see security-spec). Backend T17/T18 updated: sum of USD value over the trailing window inside the same DB transaction as token consumption; config `COOLING_OFF_WINDOW`, `BIO_ONLY_WINDOW`. Needs an index on `transactions (user_id, created_at)` (erd.md updated).
+- **D-24 Security spec housekeeping.** SEC-007 and SEC-058 are intentionally unused (ruling d); threat T1 now cites SEC-057. D-14 (403 `STEPUP_INVALID`), D-06 and D-08 confirmed by the security review. `vectors.json` `tx-preimage-1` is 138 bytes, fixed in vectors.json and contract-notes.md.
 - **D-16 Hard-locked biometric challenge.** The challenge endpoint returns a decoy for a hard-locked user (not-oracular); verify then fails uniformly.
 
 ## 4. Answers to the security-specialist open questions
@@ -90,7 +97,7 @@ BE = tasks-backend.md, FE = tasks-expo.md. Contract column = element in openapi.
 | SEC-006 | JSON body only, TLS, no query secrets | T4, T13 | T2, T21 |
 | SEC-007 | does not exist in spec (D-15) | - | - |
 | SEC-008 | `PIN_INVALID`/`PIN_LOCKED`, erd users counters | T5, T13 | - |
-| SEC-009 | erd device_pin_failures | T8, T13 | - |
+| SEC-009 | erd device_pin_failures, D-20 (8 evaluated failures per 60 min, lock-refused not counted) | T8, T13 | - |
 | SEC-010 | PinLocked response | T13 | - |
 | SEC-011 | `lockType=hard`, `/pin/reset` | T13, T14, T16 | T13, T17 |
 | SEC-012 | `recentFailures` in SessionResponse | T13, T19 | T13, T20 |
@@ -111,13 +118,13 @@ BE = tasks-backend.md, FE = tasks-expo.md. Contract column = element in openapi.
 | SEC-027 | contract-notes s1, vectors | T7, T14 | T6 |
 | SEC-028 | biometric/verify | T14 | - |
 | SEC-029 | decoy challenge, uniform 401 | T14 | T14 |
-| SEC-030 | key revoked after 5 failures | T14 | - |
+| SEC-030 | biometric suspended until next PIN unlock after 5 failures, credential required (D-18, D-19) | T14 | T14 |
 | SEC-031 | access token claims | T10 | - |
 | SEC-032 | refresh rotation, erd sessions | T5, T10 | T8 |
 | SEC-033 | `UNLOCK_REQUIRED` on refresh | T10 | T8, T9 |
 | SEC-034 | client storage | - | T7, T21 |
 | SEC-035 | `amr`, `authTime` | T10 | - |
-| SEC-036 | logout, revoke on change | T10, T16 | - |
+| SEC-036 | logout (end-session), Sign out = DELETE /devices/{current} (D-22), revoke on change | T10, T16 | T18 |
 | SEC-037 | one live family per device | T10, T13, T14 | - |
 | SEC-038 | `X-StepUp-Token`, `STEPUP_REQUIRED` | T12, T15, T17 | T15, T18 |
 | SEC-039 | `/stepup/challenge` tx fields, `txHash`, contract-notes s2 | T7, T18 | T6, T19 |
@@ -150,8 +157,9 @@ BE = tasks-backend.md, FE = tasks-expo.md. Contract column = element in openapi.
 | SEC-066 | Postgres durability (ADR-003) | T5, T20 | - |
 | SEC-067 | client backups (server: nothing to store) | - | T1, T4, T7, T21 |
 | SEC-068 | dev build, OTA off | - | T1, T4, T21 |
+| SEC-069 | rolling-window cumulative limits, `COOLING_OFF` 403, `required=pin` (D-23) | T17, T18 | T19 (display only) |
 
-Check performed: ids 001-006, 005b, 008-057, 059-068 (67 ids) all appear above; 007 and 058 flagged as nonexistent. Every BOTH-owned requirement (002, 006, 020, 022, 023, 024, 027, 039, 043, 060, 064, 067) has tasks on both sides where a client half exists.
+Check performed: ids 001-006, 005b, 008-057, 059-069 (68 ids after SEC-069 was added) all appear above; 007 and 058 flagged as nonexistent. Every BOTH-owned requirement (002, 006, 020, 022, 023, 024, 027, 039, 043, 060, 064, 067) has tasks on both sides where a client half exists.
 
 ## 6. Security test mapping (security-spec s7)
 
