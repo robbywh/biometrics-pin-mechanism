@@ -1,0 +1,36 @@
+version: "2"
+run:
+  timeout: 5m
+  tests: true
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - gosec
+    - errcheck
+    - forbidigo
+    - ineffassign
+    - unused
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: '^fmt\.Print(f|ln)?$'
+          msg: "use the redacting logger in internal/platform/log"
+        - pattern: '^log\.(Print(f|ln)?|Fatal(f|ln)?|Panic(f|ln)?)$'
+          msg: "use the redacting logger in internal/platform/log"
+        - pattern: '^slog\.(Debug|Info|Warn|Error|Log|Default|SetDefault)$'
+          msg: "default slog logger is banned; inject *slog.Logger"
+    gosec:
+      excludes:
+        - G115   # bounded int conversions reviewed manually
+        - G304
+  exclusions:
+    paths:
+      - internal/apigen
+      - internal/store/db
+    rules:
+      - path: _test\.go
+        linters: [gosec, forbidigo, errcheck]
+      - path: cmd/migrate
+        linters: [forbidigo]

@@ -1,0 +1,27 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Go
+apps/api/bin/
+*.test
+*.out
+coverage.*
+
+# Node / Expo
+node_modules/
+.expo/
+dist/
+web-build/
+*.tsbuildinfo
+# apps/mobile owns its native-folder rules in apps/mobile/.gitignore (the biometric-key module has tracked ios/ and android/ sources)
+.pnpm-store/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

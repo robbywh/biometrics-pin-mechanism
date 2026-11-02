@@ -1,0 +1,20 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.biometrickey'
+version = '1.0.0'
+
+android {
+  namespace "expo.modules.biometrickey"
+  defaultConfig {
+    versionCode 1
+    versionName '1.0.0'
+  }
+}
+
+dependencies {
+  // SEC-068: exact pinned version, reviewed. No third-party signing library.
+  implementation 'androidx.biometric:biometric:1.1.0'
+}

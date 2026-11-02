@@ -1,0 +1,1186 @@
+openapi: 3.1.0
+# NOTE: labelled 3.1 but deliberately restricted to the 3.0-compatible subset (no `const`, no type unions,
+# no `nullable`; optional fields are simply omitted). See decisions.md ADR-004. additionalProperties:false everywhere.
+info:
+  title: Crypto app - PIN and biometric login API
+  version: 1.0.0
+  description: |
+    Single source of truth for client and server (monorepo: apps/mobile and apps/api both build from this file).
+    Security spec: ./security-spec.md. Examples are illustrative (opaque tokens and hashes are not real values). Crypto byte layouts: ./contract-notes.md. Shared vectors: ./vectors/vectors.json.
+
+    ## Conventions
+    - All paths are under `/v1`. JSON only. Max request body 16 KiB.
+    - **Tokens and PINs never appear in URLs or query strings.** Tokens travel only in the `Authorization: Bearer` header
+      (or `X-StepUp-Token` for step-up tokens). PIN only in JSON bodies.
+    - Credential kinds (all `Authorization: Bearer <opaque-or-jwt>`):
+      - `accessToken`: short-lived (5 min default, <= 10 min), scope `session`. In memory on the client only.
+      - `bootstrapToken`: from `/auth/demo-login`, TTL <= 10 min, single purpose scope (`pin-setup`, `pin-verify`, `pin-reset`),
+        **no dashboard/transaction access**. Becomes bound to one deviceId when presented to `POST /devices`.
+      - `deviceCredential`: the device's current **refresh token** (or a device-bound bootstrap token with scope `pin-verify`).
+    - Challenges: nonce = 32 random bytes (base64url, no padding), TTL 60 s (server clock only), single use, consumed on the first
+      verification attempt whether it succeeds or not. `expiresAt` is integer unix seconds. Every field the client must sign is
+      returned in the challenge (the client never invents a signed field). Signed message layout: contract-notes.md section 1.
+    - Idempotency: `Idempotency-Key` (UUIDv4) required where marked. Same key + same body within 24 h returns the stored status for
+      non-token responses; token-bearing responses are never replayed (409 `IDEMPOTENT_REPLAY`, no tokens in the body). Same key +
+      different body gives 422 `IDEMPOTENCY_KEY_REUSED`.
+    - Rate limits: every response may carry `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`; 429 carries `Retry-After`.
+      Limits per SEC-057 (table in decisions.md D-12).
+    - Auth/session responses carry `Cache-Control: no-store`. Every response carries `X-Request-Id`.
+    - Error model: `{"error":{"code","message", ...}}`. `message` is generic and not for branching; branch on `code`.
+    - Binary values (nonce, signature, publicKey, txHash, boundHash) are base64url without padding. Signatures are ASN.1 DER ECDSA P-256.
+servers:
+  - url: /v1
+    description: Relative so any host works (httptest random port, emulator 10.0.2.2, LAN). Cleartext only for dev builds, release builds are HTTPS only (SEC-006). Clients take the origin from EXPO_PUBLIC_API_URL.
+tags:
+  - name: bootstrap
+  - name: pin
+  - name: devices
+  - name: biometric
+  - name: session
+  - name: stepup
+  - name: transactions
+  - name: dashboard
+  - name: ops
+security: []
+paths:
+  /healthz:
+    servers:
+      - url: /
+    get:
+      tags: [ops]
+      operationId: healthz
+      summary: Liveness and fail-closed readiness (unauthenticated, no data)
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /auth/demo-login:
+    post:
+      tags: [bootstrap]
+      operationId: demoLogin
+      summary: Demo primary login (stand-in for password+2FA). Returns a limited-scope bootstrap token only.
+      description: |
+        Requires the per-account demo secret from server config (SEC-016). Only available when server runs with DEMO_MODE=true.
+        Scope chosen by server state and `intent`:
+        - intent `login`, no PIN set -> `pin-setup`
+        - intent `login`, PIN set -> `pin-verify`
+        - intent `reset` (PIN set or hard-locked) -> `pin-reset`; intent `reset` with no PIN set behaves as `login` (`pin-setup`).
+        The token cannot reach `/dashboard`, `/transactions` or any access-token endpoint (403 `SCOPE_INSUFFICIENT`).
+        Wrong username/secret both give the same 401 `AUTH_FAILED`. Limits: 5/min/IP, 20/h/IP, global circuit breaker.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DemoLoginRequest' }
+            examples:
+              login: { value: { username: alice, secret: demo-secret-from-config, intent: login } }
+              reset: { value: { username: alice, secret: demo-secret-from-config, intent: reset } }
+      responses:
+        '200':
+          description: Bootstrap token issued
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BootstrapResponse' }
+              examples:
+                setup: { value: { bootstrapToken: 'Zm9vYmFyYmF6cXV4Zm9vYmFyYmF6cXV4Zm9vYmFyYmF6cXV4', expiresIn: 600, scope: pin-setup } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /devices:
+    post:
+      tags: [devices]
+      operationId: registerDevice
+      summary: Register this installation as a device; server generates the deviceId and binds the bootstrap token to it
+      description: |
+        Credential: `bootstrapToken` with scope `pin-setup`, `pin-verify` or `pin-reset`, not yet bound to a device.
+        On success the presented bootstrap token becomes bound (server side) to the new deviceId; no token is returned, so this
+        endpoint is safely idempotent. Max 5 active devices per user (409 `DEVICE_LIMIT`), EXCEPT registration with a `pin-reset` scoped
+        token, which is exempt from the cap (reset revokes all other devices moments later, so a hard-locked user with 5 devices can recover). Registering a device starts cooling-off
+        (SEC-047) unless it is the user's first device. Client hardware identifiers are not accepted as identity.
+      security: [{ bootstrapToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterDeviceRequest' }
+            examples:
+              ios: { value: { name: "Robby's iPhone", platform: ios } }
+      responses:
+        '201':
+          description: Device created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegisterDeviceResponse' }
+              examples:
+                created: { value: { deviceId: 2f0c9a4e-5b1d-4c6e-9a3f-7d8e1b2c3d4e, createdAt: 1767225600, coolingOffUntil: 1767312000 } }
+        '200':
+          description: Idempotent replay of the same request (same Idempotency-Key and body)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegisterDeviceResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '403': { $ref: '#/components/responses/ScopeInsufficient' }
+        '409':
+          description: Device limit reached (`DEVICE_LIMIT`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                limit: { value: { error: { code: DEVICE_LIMIT, message: Request could not be completed. } } }
+        '422': { $ref: '#/components/responses/IdempotencyKeyReused' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      tags: [devices]
+      operationId: listDevices
+      summary: List the caller's own devices
+      security: [{ accessToken: [] }]
+      responses:
+        '200':
+          description: Devices
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceList' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '403': { $ref: '#/components/responses/ScopeInsufficient' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /devices/{deviceId}:
+    delete:
+      tags: [devices]
+      operationId: revokeDevice
+      summary: Revoke a device (sessions, refresh tokens, biometric keys)
+      description: |
+        Revoking the **current** device (deviceId equals the token's `did`) needs only a valid access token.
+        Revoking **another** device needs `X-StepUp-Token` from a `/stepup` flow with action `revoke_device` and
+        `targetDeviceId` equal to the path id (required proof: PIN). Foreign or unknown ids return 404 `NOT_FOUND`.
+      security: [{ accessToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/DeviceIdPath' }
+        - { $ref: '#/components/parameters/StepUpToken' }
+      responses:
+        '204': { description: Revoked }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '403': { $ref: '#/components/responses/StepUpRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /pin:
+    post:
+      tags: [pin]
+      operationId: setPin
+      summary: Set the initial PIN (only when no PIN exists)
+      description: |
+        Credential: device-bound `bootstrapToken` with scope `pin-setup` (device registered via `POST /devices`).
+        If the user already has a PIN: 409 `PIN_ALREADY_SET` and nothing changes (SEC-015). Weak PIN: 422 `PIN_WEAK`.
+        Bootstrap token is single use. Response carries tokens, so an idempotent replay returns 409 `IDEMPOTENT_REPLAY`.
+      security: [{ bootstrapToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetPinRequest' }
+            examples:
+              ok: { value: { pin: '493017' } }
+      responses:
+        '201':
+          description: PIN set; session issued (amr=pin)
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '403': { $ref: '#/components/responses/ScopeInsufficient' }
+        '409': { $ref: '#/components/responses/PinAlreadySetOrReplay' }
+        '422': { $ref: '#/components/responses/PinPolicyOrIdempotency' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    put:
+      tags: [pin]
+      operationId: changePin
+      summary: Change PIN (old PIN required; counts toward lockout)
+      description: |
+        Revokes all OTHER sessions and biometric keys on OTHER devices; current device session is re-issued (new tokens) and its
+        biometric key stays (SEC-045). Wrong old PIN uses the same counter and responses as pin/verify (`PIN_INVALID`/`PIN_LOCKED`).
+        New PIN equal to old: 422 `PIN_UNCHANGED`. Limit 5/h/user. Token-bearing response: replay gives 409 `IDEMPOTENT_REPLAY`.
+      security: [{ accessToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePinRequest' }
+      responses:
+        '200':
+          description: PIN changed; session re-issued
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/PinOrAuthFailed' }
+        '409': { $ref: '#/components/responses/IdempotentReplay' }
+        '422': { $ref: '#/components/responses/PinPolicyOrIdempotency' }
+        '423': { $ref: '#/components/responses/PinLocked' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /pin/reset:
+    post:
+      tags: [pin]
+      operationId: resetPin
+      summary: Forgot PIN / hard-lock recovery
+      description: |
+        Credential: device-bound `bootstrapToken` scope `pin-reset` (demo-login intent `reset`, then `POST /devices`).
+        Effects (SEC-046): sets new PIN; clears lock counters; revokes ALL sessions, ALL biometric keys and ALL device records of the user
+        (the device just registered survives); starts cooling-off; audit event. The client must discard its old deviceId and re-enroll
+        biometrics via the full flow. Token-bearing response: replay gives 409 `IDEMPOTENT_REPLAY`.
+      security: [{ bootstrapToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetPinRequest' }
+      responses:
+        '200':
+          description: PIN reset; session issued for the registering device
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '403': { $ref: '#/components/responses/ScopeInsufficient' }
+        '409': { $ref: '#/components/responses/IdempotentReplay' }
+        '422': { $ref: '#/components/responses/PinPolicyOrIdempotency' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/pin/verify:
+    post:
+      tags: [session]
+      operationId: verifyPin
+      summary: PIN unlock -> new session (new refresh family)
+      description: |
+        Credential (SEC-014): `deviceCredential` = the device's current refresh token, or the device-bound bootstrap token (scope `pin-verify`).
+        The body `deviceId` must equal the credential's device or the call is 401 `AUTH_FAILED` and no counter is touched.
+        The lock state is checked BEFORE the PIN (a correct PIN during lock still returns 423). Attempt 1-4 wrong: 401 `PIN_INVALID` with
+        `attemptsRemaining` (5 minus failures). Failure 5 and every later failure: 423 `PIN_LOCKED` with `retryAfter` and `lockType` (soft),
+        failure 10: `lockType` hard (no `retryAfter`). A wrong PIN does NOT consume or rotate the refresh token.
+        Success: new family, refresh token rotated, counter reset, `amr=pin`. 30 req/min/IP, 10/min/device.
+      security: [{ deviceCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VerifyPinRequest' }
+            examples:
+              ok: { value: { deviceId: 2f0c9a4e-5b1d-4c6e-9a3f-7d8e1b2c3d4e, pin: '493017' } }
+      responses:
+        '200':
+          description: Unlocked
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Missing/invalid/revoked credential, device mismatch (`AUTH_FAILED`, counter untouched) or wrong PIN (`PIN_INVALID`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                wrongPin: { value: { error: { code: PIN_INVALID, message: Authentication failed., attemptsRemaining: 3 } } }
+                noCredential: { value: { error: { code: AUTH_FAILED, message: Authentication failed. } } }
+        '423': { $ref: '#/components/responses/PinLocked' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /auth/biometric/challenge:
+    post:
+      tags: [biometric]
+      operationId: biometricChallenge
+      summary: Request a login challenge (unauthenticated, non-oracular)
+      description: |
+        Always returns 200 with a well-formed challenge. For an unknown, revoked, not-enrolled or hard-locked device the nonce, challengeId and
+        userId are random decoys (not stored as live). Clients cannot tell the difference (SEC-029). One live login challenge per device.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BiometricChallengeRequest' }
+      responses:
+        '200':
+          description: Challenge
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Challenge' }
+              examples:
+                login:
+                  value:
+                    challengeId: 7b1f0f3e-8d2a-4b53-a1c4-5e6f7a8b9c0d
+                    purpose: login
+                    userId: 11111111-1111-4111-8111-111111111111
+                    deviceId: 2f0c9a4e-5b1d-4c6e-9a3f-7d8e1b2c3d4e
+                    nonce: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
+                    expiresAt: 1767225660
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/biometric/verify:
+    post:
+      tags: [biometric]
+      operationId: biometricVerify
+      summary: Verify the signed challenge -> new session (amr=bio)
+      description: |
+        The signature is the credential (no Authorization header). The server rebuilds the signed message from its stored challenge
+        (contract-notes.md section 1), checks device not revoked, user not hard-locked, active key, challenge live/unconsumed, signature valid.
+        Every failure mode returns the identical 401 `AUTH_FAILED` (SEC-029). Allowed during a SOFT PIN lock, refused during HARD lock.
+        5 consecutive failures per device revoke that device's biometric key (PIN counter untouched; SEC-030).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BiometricVerifyRequest' }
+      responses:
+        '200':
+          description: Unlocked
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/refresh:
+    post:
+      tags: [session]
+      operationId: refresh
+      summary: Rotate the refresh token and get a new access token (no body; refresh token in Authorization header)
+      description: |
+        Credential: `deviceCredential` (refresh token) in `Authorization`. Succeeds only while the server-side unlock window holds:
+        `now - last_unlock_at <= 15 min` and idle `<= 5 min` (SEC-033). Otherwise 401 `UNLOCK_REQUIRED`, and the refresh token is NOT
+        consumed, NOT rotated and does NOT trigger reuse detection (the client then uses PIN or biometric). Presenting an already-used or
+        revoked refresh token revokes its whole family (audit `REFRESH_REUSE`) and returns 401 `AUTH_FAILED`.
+        Limits: absolute lifetime 30 d, idle 7 d. 6/min/device. `amr` and `auth_time` of the new access token are inherited from the session.
+      security: [{ deviceCredential: [] }]
+      responses:
+        '200':
+          description: New access token and rotated refresh token
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        '401':
+          description: 'AUTH_FAILED (invalid/reused/revoked/expired) or UNLOCK_REQUIRED'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                unlock: { value: { error: { code: UNLOCK_REQUIRED, message: Unlock required. } } }
+                reuse: { value: { error: { code: AUTH_FAILED, message: Authentication failed. } } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/logout:
+    post:
+      tags: [session]
+      operationId: logout
+      summary: Revoke the current session and refresh family
+      security: [{ accessToken: [] }]
+      responses:
+        '204': { description: Logged out }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+
+  /devices/{deviceId}/biometric/enroll/challenge:
+    post:
+      tags: [biometric]
+      operationId: biometricEnrollChallenge
+      summary: Step 1 of enrollment - issue an enroll challenge (consumes the PIN step-up token)
+      description: |
+        Requires `accessToken` of the same device (path id must equal token `did`, else 404) and `X-StepUp-Token` for action
+        `enable_biometric` with `targetDeviceId` = path id and a PIN proof (biometric alone never enables biometrics). This call
+        CONSUMES the step-up token and binds the resulting enroll challenge to the session and device (single live enroll challenge
+        per device; a new request supersedes). Without/with bad token: 403 `STEPUP_REQUIRED` / `STEPUP_INVALID`. Limit 5/h/user.
+      security: [{ accessToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/DeviceIdPath' }
+        - { $ref: '#/components/parameters/StepUpTokenRequired' }
+      responses:
+        '200':
+          description: Enroll challenge (purpose `enroll`)
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Challenge' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '403': { $ref: '#/components/responses/StepUpRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /devices/{deviceId}/biometric/enroll:
+    post:
+      tags: [biometric]
+      operationId: biometricEnroll
+      summary: Step 2 of enrollment - submit public key with proof of possession
+      description: |
+        The client signs the enroll challenge (message purpose `enroll`, empty boundHash) with the NEW key after a biometric prompt.
+        Server verifies signature against the submitted `publicKey` (SPKI DER, P-256 only, <= 200 bytes, point on curve) and consumes the
+        challenge on first attempt. Success revokes any previous key atomically and starts cooling-off. Bad PoP, expired or replayed
+        challenge: 401 `AUTH_FAILED`. Bad key: 422 `INVALID_PUBLIC_KEY`. Demo: attestation is stored, not verified (type `none`).
+      security: [{ accessToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/DeviceIdPath' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BiometricEnrollRequest' }
+      responses:
+        '201':
+          description: Key active
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BiometricEnrollResponse' }
+              examples:
+                ok: { value: { keyId: 5d0b8f0c-2a41-4a7e-9d58-0c1b2a3d4e5f, keyFingerprint: 'q83vEjRWeJA', biometricEnabled: true, coolingOffUntil: 1767312000 } }
+        '200':
+          description: Idempotent replay (same key and body); no secrets in body
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BiometricEnrollResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: Invalid public key (`INVALID_PUBLIC_KEY`), validation, or `IDEMPOTENCY_KEY_REUSED`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                badKey: { value: { error: { code: INVALID_PUBLIC_KEY, message: Request could not be completed. } } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /devices/{deviceId}/biometric:
+    delete:
+      tags: [biometric]
+      operationId: biometricDisable
+      summary: Disable biometrics for the device (revokes the key and its challenges)
+      description: |
+        Allowed when the session's `last_unlock_at` (PIN or biometric unlock, or step-up) is within 5 minutes, otherwise 403 `STEPUP_REQUIRED`
+        (the client re-unlocks with PIN or biometrics, then retries). Used after key invalidation (SEC-023) right after a PIN unlock.
+        Idempotent: deleting when nothing is enrolled still returns 204 for an owned device.
+      security: [{ accessToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/DeviceIdPath' }
+      responses:
+        '204': { description: Disabled }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '403': { $ref: '#/components/responses/StepUpRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /stepup/challenge:
+    post:
+      tags: [stepup]
+      operationId: stepupChallenge
+      summary: Start a step-up for a sensitive action
+      description: |
+        `action` selects the body shape:
+        - `transaction`: full transaction fields; the server canonicalises and computes `txHash` (contract-notes.md section 2), returns it
+          with a human-readable `summary` to display (the client never supplies a hash).
+        - `enable_biometric` / `revoke_device`: `targetDeviceId`; `boundHash` = action hash (contract-notes.md section 3).
+        `required` states which proof the server will accept: `bio`, `pin` or `either`. enable_biometric and revoke_device are always `pin`.
+        For `transaction`: amount above `BIO_ONLY_MAX`, a key in cooling-off, or an unattested key in production gives `pin`.
+        During cooling-off a transaction above `COOLING_OFF_MAX` fails here already with 403 `COOLING_OFF`.
+        A new challenge supersedes the previous live step-up challenge of that session. 10/min/user.
+      security: [{ accessToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StepUpChallengeRequest' }
+            examples:
+              tx:
+                value:
+                  action: transaction
+                  tx: { asset: ETH, network: ethereum, destination: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', amount: '1.5', fee: '0.001', txNonce: 33333333-3333-4333-8333-333333333333, expiry: 1767225900 }
+              enable: { value: { action: enable_biometric, targetDeviceId: 2f0c9a4e-5b1d-4c6e-9a3f-7d8e1b2c3d4e } }
+      responses:
+        '200':
+          description: Step-up challenge
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StepUpChallenge' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '403': { $ref: '#/components/responses/CoolingOffOrScope' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationUnprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /stepup/verify:
+    post:
+      tags: [stepup]
+      operationId: stepupVerify
+      summary: Prove the step-up (signature or PIN) -> single-use step-up token
+      description: |
+        Exactly one of `signature` (biometric key, message purpose `stepup`, boundHash from the challenge) or `pin`. The challenge is consumed on the
+        first attempt. A PIN proof counts toward the SAME user counter and lock as pin/verify (SEC-042): `PIN_INVALID` / `PIN_LOCKED`.
+        Proof kind not allowed by the challenge's `required` (e.g. signature when `pin` required): 403 `STEPUP_REQUIRED` with `required`.
+        Bad signature/expired/replayed/unknown: 401 `AUTH_FAILED`. Token TTL 60 s, bound to session, device, action and boundHash.
+      security: [{ accessToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StepUpVerifyRequest' }
+      responses:
+        '200':
+          description: Step-up token
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StepUpTokenResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/PinOrAuthFailed' }
+        '403': { $ref: '#/components/responses/StepUpRequired' }
+        '423': { $ref: '#/components/responses/PinLocked' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /transactions:
+    post:
+      tags: [transactions]
+      operationId: createTransaction
+      summary: Demo send (mock). Requires step-up token; server recomputes the tx hash from this body
+      description: |
+        Same transaction fields as the step-up challenge. The server recomputes `txHash` from THIS body and compares with the step-up token's
+        bound hash; mismatch, reuse, other session/device, expired: 403 `STEPUP_INVALID` (token consumed where it was valid). The token is
+        consumed atomically with transaction creation (SEC-040). Missing header: 403 `STEPUP_REQUIRED`. Within cooling-off and above
+        `COOLING_OFF_MAX`: 403 `COOLING_OFF`. No client-supplied approval flags exist. 20/min/user. The response contains no tokens, so
+        idempotent replays return the stored 202.
+      security: [{ accessToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/StepUpTokenRequired' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransactionFields' }
+      responses:
+        '202':
+          description: Accepted (mock)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionResponse' }
+              examples:
+                ok: { value: { transactionId: 9c8b7a6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d, status: accepted_mock, txHash: 'X1l0fN0mL8w1y0n4Wq3kVx5g0m2S8bJp9d7oUqz1HcE' } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '403':
+          description: 'STEPUP_REQUIRED, STEPUP_INVALID or COOLING_OFF'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                mismatch: { value: { error: { code: STEPUP_INVALID, message: Additional verification is required. } } }
+                coolingOff: { value: { error: { code: COOLING_OFF, message: This action is temporarily limited., retryAfter: 3600 } } }
+        '409': { $ref: '#/components/responses/IdempotentReplay' }
+        '422':
+          description: 'INSUFFICIENT_FUNDS, IDEMPOTENCY_KEY_REUSED or validation'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                funds: { value: { error: { code: INSUFFICIENT_FUNDS, message: Request could not be completed. } } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /dashboard:
+    get:
+      tags: [dashboard]
+      operationId: getDashboard
+      summary: Mock balances (access token required; bootstrap token gets 403)
+      security: [{ accessToken: [] }]
+      responses:
+        '200':
+          description: Mock portfolio
+          headers:
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dashboard' }
+              examples:
+                ok:
+                  value:
+                    currency: USD
+                    totalValue: '12843.20'
+                    balances:
+                      - { asset: BTC, amount: '0.15', value: '9750.00' }
+                      - { asset: ETH, amount: '1.2', value: '3000.00' }
+                      - { asset: USDC, amount: '93.20', value: '93.20' }
+        '401': { $ref: '#/components/responses/AuthFailed' }
+        '403': { $ref: '#/components/responses/ScopeInsufficient' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+components:
+  securitySchemes:
+    accessToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT (EdDSA) - claims sub, sid, did, amr, auth_time, scope=session, aud, exp
+      description: Short-lived access token. Bootstrap tokens presented here give 403 SCOPE_INSUFFICIENT.
+    bootstrapToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque (256-bit, base64url)
+      description: From /auth/demo-login. Scope pin-setup, pin-verify or pin-reset. TTL <= 10 min. Bound to a deviceId by POST /devices.
+    deviceCredential:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque (256-bit, base64url)
+      description: The device's current refresh token, or a device-bound bootstrap token with scope pin-verify (pin/verify only).
+
+  headers:
+    CacheControlNoStore:
+      description: Always `no-store` on auth/session responses
+      schema: { type: string, enum: [no-store] }
+    RateLimitLimit:
+      description: Requests allowed in the current window
+      schema: { type: integer }
+    RateLimitRemaining:
+      description: Requests left in the current window
+      schema: { type: integer }
+    RateLimitReset:
+      description: Seconds until the window resets
+      schema: { type: integer }
+    RetryAfter:
+      description: Seconds to wait before retrying
+      schema: { type: integer, minimum: 0 }
+    RequestId:
+      description: Server-generated request id (also accepted from client as X-Request-Id, max 64 chars [A-Za-z0-9-])
+      schema: { type: string, maxLength: 64 }
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUIDv4. Stored 24 h per (user, endpoint). Never logged.
+      schema: { type: string, format: uuid }
+    DeviceIdPath:
+      name: deviceId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    StepUpToken:
+      name: X-StepUp-Token
+      in: header
+      required: false
+      description: Single-use step-up token from /stepup/verify. Header only (never query).
+      schema: { $ref: '#/components/schemas/OpaqueToken' }
+    StepUpTokenRequired:
+      name: X-StepUp-Token
+      in: header
+      required: true
+      description: Single-use step-up token from /stepup/verify. Header only (never query).
+      schema: { $ref: '#/components/schemas/OpaqueToken' }
+
+  responses:
+    ValidationError:
+      description: Malformed request, unknown field, wrong type or missing header (`VALIDATION_ERROR`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            invalid: { value: { error: { code: VALIDATION_ERROR, message: Invalid request. } } }
+    ValidationUnprocessable:
+      description: Semantically invalid fields (`VALIDATION_ERROR`, e.g. unsupported asset/network pair, expiry out of range)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    AuthFailed:
+      description: Missing, invalid, expired, revoked or replayed credential. One uniform body (`AUTH_FAILED`).
+      headers:
+        Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            failed: { value: { error: { code: AUTH_FAILED, message: Authentication failed. } } }
+    PinOrAuthFailed:
+      description: 'AUTH_FAILED (credential problem) or PIN_INVALID (wrong PIN; only after the credential was validated; includes attemptsRemaining)'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            wrongPin: { value: { error: { code: PIN_INVALID, message: Authentication failed., attemptsRemaining: 2 } } }
+    PinLocked:
+      description: 'PIN_LOCKED. Soft lock has retryAfter and lockType=soft; hard lock has lockType=hard and no retryAfter (recover via /pin/reset).'
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            soft: { value: { error: { code: PIN_LOCKED, message: Try again later., retryAfter: 30, lockType: soft, attemptsUntilHardLock: 5 } } }
+            hard: { value: { error: { code: PIN_LOCKED, message: Reset required., lockType: hard } } }
+    ScopeInsufficient:
+      description: 'Credential is valid but its scope or kind is not allowed here (SCOPE_INSUFFICIENT), e.g. bootstrap token on /dashboard'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            bootstrap: { value: { error: { code: SCOPE_INSUFFICIENT, message: Not permitted. } } }
+    NotFound:
+      description: Unknown resource OR resource owned by another user (`NOT_FOUND`, indistinguishable)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            nf: { value: { error: { code: NOT_FOUND, message: Not found. } } }
+    StepUpRequired:
+      description: 'STEPUP_REQUIRED (missing/insufficient proof; includes required=bio|pin|either) or STEPUP_INVALID (bad/used/expired/mismatched step-up token)'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            needPin: { value: { error: { code: STEPUP_REQUIRED, message: Additional verification is required., required: pin } } }
+            invalid: { value: { error: { code: STEPUP_INVALID, message: Additional verification is required. } } }
+    CoolingOffOrScope:
+      description: 'COOLING_OFF (retryAfter seconds) or SCOPE_INSUFFICIENT'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    PinAlreadySetOrReplay:
+      description: 'PIN_ALREADY_SET (existing PIN untouched) or IDEMPOTENT_REPLAY'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            set: { value: { error: { code: PIN_ALREADY_SET, message: Request could not be completed. } } }
+    IdempotentReplay:
+      description: 'IDEMPOTENT_REPLAY. The original request already succeeded; its token-bearing response is never replayed. Unlock via pin/verify.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            replay: { value: { error: { code: IDEMPOTENT_REPLAY, message: Request already processed. } } }
+    IdempotencyKeyReused:
+      description: Same Idempotency-Key with a different body (`IDEMPOTENCY_KEY_REUSED`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    PinPolicyOrIdempotency:
+      description: 'PIN_WEAK, PIN_UNCHANGED, or IDEMPOTENCY_KEY_REUSED. PIN_WEAK message is generic and never reveals the blocklist.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            weak: { value: { error: { code: PIN_WEAK, message: Choose a less predictable PIN. } } }
+            unchanged: { value: { error: { code: PIN_UNCHANGED, message: Choose a different PIN. } } }
+    RateLimited:
+      description: Too many requests (`RATE_LIMITED`)
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+        RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+        RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            limited: { value: { error: { code: RATE_LIMITED, message: Too many requests., retryAfter: 12 } } }
+    ServiceUnavailable:
+      description: Fail-closed (misconfiguration or store unreachable). `SERVICE_UNAVAILABLE`, never defaults to open.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  schemas:
+    # ---- primitives ----
+    Uuid:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      description: Lowercase canonical form. This exact string is what gets signed (contract-notes.md).
+    Base64Url:
+      type: string
+      pattern: '^[A-Za-z0-9_-]+$'
+      maxLength: 512
+      description: base64url, no padding
+    OpaqueToken:
+      type: string
+      pattern: '^[A-Za-z0-9_-]{43,512}$'
+    Pin:
+      type: string
+      pattern: '^[0-9]{6}$'
+      minLength: 6
+      maxLength: 6
+      writeOnly: true
+      description: Exactly 6 digits. Only ever a request-body field; never in a response, URL or log.
+    DecimalString:
+      type: string
+      pattern: '^(0|[1-9][0-9]{0,17})(\.[0-9]{1,18})?$'
+      maxLength: 38
+      description: Non-negative decimal string, no exponent, no sign. Server normalises (contract-notes.md section 2).
+    UnixSeconds:
+      type: integer
+      format: int64
+      minimum: 0
+
+    # ---- errors ----
+    ErrorCode:
+      type: string
+      description: |
+        Stable machine-readable codes with HTTP status:
+        VALIDATION_ERROR 400/422; AUTH_FAILED 401; PIN_INVALID 401; UNLOCK_REQUIRED 401; STEPUP_REQUIRED 403; STEPUP_INVALID 403;
+        COOLING_OFF 403; SCOPE_INSUFFICIENT 403; NOT_FOUND 404; PIN_ALREADY_SET 409; DEVICE_LIMIT 409; IDEMPOTENT_REPLAY 409;
+        PIN_WEAK 422; PIN_UNCHANGED 422; IDEMPOTENCY_KEY_REUSED 422; INVALID_PUBLIC_KEY 422; INSUFFICIENT_FUNDS 422;
+        PIN_LOCKED 423; RATE_LIMITED 429; SERVICE_UNAVAILABLE 503; INTERNAL 500.
+        Challenge expired/replayed/bad signature/unknown device/revoked key are ALL AUTH_FAILED externally.
+      enum: [VALIDATION_ERROR, AUTH_FAILED, PIN_INVALID, UNLOCK_REQUIRED, STEPUP_REQUIRED, STEPUP_INVALID, COOLING_OFF, SCOPE_INSUFFICIENT, NOT_FOUND, PIN_ALREADY_SET, DEVICE_LIMIT, IDEMPOTENT_REPLAY, PIN_WEAK, PIN_UNCHANGED, IDEMPOTENCY_KEY_REUSED, INVALID_PUBLIC_KEY, INSUFFICIENT_FUNDS, PIN_LOCKED, RATE_LIMITED, SERVICE_UNAVAILABLE, INTERNAL]
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code: { $ref: '#/components/schemas/ErrorCode' }
+            message: { type: string, maxLength: 200, description: Generic text; never branch on it }
+            attemptsRemaining: { type: integer, minimum: 0, maximum: 4, description: Only on PIN_INVALID after the device credential was validated }
+            attemptsUntilHardLock: { type: integer, minimum: 0, maximum: 10, description: 'Only on soft PIN_LOCKED after the credential was validated' }
+            retryAfter: { type: integer, minimum: 0, description: 'Seconds. Used by PIN_LOCKED soft, RATE_LIMITED and COOLING_OFF; mirrors Retry-After' }
+            lockType: { type: string, enum: [soft, hard] }
+            required: { type: string, enum: [bio, pin, either], description: Only on STEPUP_REQUIRED }
+
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+
+    # ---- bootstrap / devices ----
+    DemoLoginRequest:
+      type: object
+      additionalProperties: false
+      required: [username, secret, intent]
+      properties:
+        username: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-z0-9_.-]+$' }
+        secret: { type: string, minLength: 1, maxLength: 256, writeOnly: true }
+        intent: { type: string, enum: [login, reset] }
+    BootstrapResponse:
+      type: object
+      additionalProperties: false
+      required: [bootstrapToken, expiresIn, scope]
+      properties:
+        bootstrapToken: { $ref: '#/components/schemas/OpaqueToken' }
+        expiresIn: { type: integer, maximum: 600, description: Seconds }
+        scope: { type: string, enum: [pin-setup, pin-verify, pin-reset] }
+    RiskSignals:
+      type: object
+      additionalProperties: false
+      description: Advisory only (SEC-056/064). Server stores it; never used as the sole gate.
+      properties:
+        rooted: { type: boolean }
+        debugger: { type: boolean }
+        emulator: { type: boolean }
+    RegisterDeviceRequest:
+      type: object
+      additionalProperties: false
+      required: [name, platform]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 64 }
+        platform: { type: string, enum: [ios, android] }
+        risk: { $ref: '#/components/schemas/RiskSignals' }
+    RegisterDeviceResponse:
+      type: object
+      additionalProperties: false
+      required: [deviceId, createdAt]
+      properties:
+        deviceId: { $ref: '#/components/schemas/Uuid' }
+        createdAt: { $ref: '#/components/schemas/UnixSeconds' }
+        coolingOffUntil: { $ref: '#/components/schemas/UnixSeconds' }
+    Device:
+      type: object
+      additionalProperties: false
+      required: [id, name, platform, createdAt, lastSeenAt, current, biometricEnabled]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        name: { type: string }
+        platform: { type: string, enum: [ios, android] }
+        createdAt: { $ref: '#/components/schemas/UnixSeconds' }
+        lastSeenAt: { $ref: '#/components/schemas/UnixSeconds' }
+        current: { type: boolean }
+        biometricEnabled: { type: boolean }
+    DeviceList:
+      type: object
+      additionalProperties: false
+      required: [devices]
+      properties:
+        devices:
+          type: array
+          maxItems: 5
+          items: { $ref: '#/components/schemas/Device' }
+
+    # ---- PIN / session ----
+    SetPinRequest:
+      type: object
+      additionalProperties: false
+      required: [pin]
+      properties:
+        pin: { $ref: '#/components/schemas/Pin' }
+    ChangePinRequest:
+      type: object
+      additionalProperties: false
+      required: [oldPin, newPin]
+      properties:
+        oldPin: { $ref: '#/components/schemas/Pin' }
+        newPin: { $ref: '#/components/schemas/Pin' }
+    VerifyPinRequest:
+      type: object
+      additionalProperties: false
+      required: [deviceId, pin]
+      properties:
+        deviceId: { $ref: '#/components/schemas/Uuid' }
+        pin: { $ref: '#/components/schemas/Pin' }
+        risk: { $ref: '#/components/schemas/RiskSignals' }
+    SessionResponse:
+      type: object
+      additionalProperties: false
+      description: |
+        Returned by pin set, pin change, pin reset, pin/verify, biometric/verify and refresh. Contains tokens: never cache, never log,
+        never replay. `refreshToken` must be stored only in SecureStore; `accessToken` in memory only.
+      required: [accessToken, expiresIn, refreshToken, amr, authTime, deviceId, biometricEnabled]
+      properties:
+        accessToken: { type: string, maxLength: 2048 }
+        expiresIn: { type: integer, description: 'Seconds (max 600, default 300)' }
+        refreshToken: { $ref: '#/components/schemas/OpaqueToken' }
+        amr: { type: string, enum: [pin, bio] }
+        authTime: { $ref: '#/components/schemas/UnixSeconds' }
+        deviceId: { $ref: '#/components/schemas/Uuid' }
+        biometricEnabled: { type: boolean, description: Server-authoritative state for THIS device }
+        recentFailures: { type: integer, minimum: 0, description: Failed PIN attempts since the last successful unlock (unlock responses only; SEC-012) }
+        coolingOffUntil: { $ref: '#/components/schemas/UnixSeconds' }
+      example:
+        accessToken: eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEifQ.c2ln
+        expiresIn: 300
+        refreshToken: cmVmcmVzaHRva2VucmVmcmVzaHRva2VucmVmcmVzaHRva2Vu
+        amr: pin
+        authTime: 1767225600
+        deviceId: 2f0c9a4e-5b1d-4c6e-9a3f-7d8e1b2c3d4e
+        biometricEnabled: false
+        recentFailures: 0
+
+    # ---- biometric ----
+    BiometricChallengeRequest:
+      type: object
+      additionalProperties: false
+      required: [deviceId]
+      properties:
+        deviceId: { $ref: '#/components/schemas/Uuid' }
+    Challenge:
+      type: object
+      additionalProperties: false
+      description: |
+        Every signed field is here. The client signs the message of contract-notes.md section 1 built from exactly these values
+        (`boundHash` absent means empty). For decoys the shape is identical.
+      required: [challengeId, purpose, userId, deviceId, nonce, expiresAt]
+      properties:
+        challengeId: { $ref: '#/components/schemas/Uuid' }
+        purpose: { type: string, enum: [login, enroll] }
+        userId: { $ref: '#/components/schemas/Uuid' }
+        deviceId: { $ref: '#/components/schemas/Uuid' }
+        nonce: { $ref: '#/components/schemas/Base64Url' }
+        expiresAt: { $ref: '#/components/schemas/UnixSeconds' }
+        boundHash: { $ref: '#/components/schemas/Base64Url' }
+    BiometricVerifyRequest:
+      type: object
+      additionalProperties: false
+      required: [challengeId, deviceId, signature]
+      properties:
+        challengeId: { $ref: '#/components/schemas/Uuid' }
+        deviceId: { $ref: '#/components/schemas/Uuid' }
+        signature: { $ref: '#/components/schemas/Base64Url' }
+        risk: { $ref: '#/components/schemas/RiskSignals' }
+    Attestation:
+      type: object
+      additionalProperties: false
+      description: Demo - stored, not verified; type must be `none`. Production profile rejects `none` for biometric-only allowance (SEC-022).
+      required: [type, keySecurityLevel]
+      properties:
+        type: { type: string, enum: [none, android_key, app_attest, play_integrity] }
+        keySecurityLevel: { type: string, enum: [secure_enclave, strongbox, tee, software, unknown], description: 'Self-reported and untrusted in the demo' }
+        data: { $ref: '#/components/schemas/Base64Url' }
+    BiometricEnrollRequest:
+      type: object
+      additionalProperties: false
+      required: [challengeId, publicKey, attestation, signature]
+      properties:
+        challengeId: { $ref: '#/components/schemas/Uuid' }
+        publicKey: { $ref: '#/components/schemas/Base64Url' }
+        attestation: { $ref: '#/components/schemas/Attestation' }
+        signature: { $ref: '#/components/schemas/Base64Url' }
+    BiometricEnrollResponse:
+      type: object
+      additionalProperties: false
+      required: [keyId, keyFingerprint, biometricEnabled]
+      properties:
+        keyId: { $ref: '#/components/schemas/Uuid' }
+        keyFingerprint: { type: string, description: 'base64url of first 8 bytes of SHA-256(SPKI DER); non-secret' }
+        biometricEnabled: { type: boolean }
+        coolingOffUntil: { $ref: '#/components/schemas/UnixSeconds' }
+
+    # ---- step-up / transactions ----
+    TransactionFields:
+      type: object
+      additionalProperties: false
+      required: [asset, network, destination, amount, fee, txNonce, expiry]
+      properties:
+        asset: { type: string, enum: [BTC, ETH, USDC] }
+        network: { type: string, enum: [bitcoin, ethereum] }
+        destination: { type: string, pattern: '^[A-Za-z0-9]{26,90}$', description: 'ASCII only; hashed as exact bytes (no case folding); a 0x prefix is allowed' }
+        amount: { $ref: '#/components/schemas/DecimalString' }
+        fee: { $ref: '#/components/schemas/DecimalString' }
+        txNonce: { $ref: '#/components/schemas/Uuid' }
+        expiry: { $ref: '#/components/schemas/UnixSeconds' }
+    StepUpTxRequest:
+      type: object
+      additionalProperties: false
+      required: [action, tx]
+      properties:
+        action: { type: string, enum: [transaction] }
+        tx: { $ref: '#/components/schemas/TransactionFields' }
+    StepUpTargetRequest:
+      type: object
+      additionalProperties: false
+      required: [action, targetDeviceId]
+      properties:
+        action: { type: string, enum: [enable_biometric, revoke_device] }
+        targetDeviceId: { $ref: '#/components/schemas/Uuid' }
+    StepUpChallengeRequest:
+      oneOf:
+        - $ref: '#/components/schemas/StepUpTxRequest'
+        - $ref: '#/components/schemas/StepUpTargetRequest'
+    StepUpSummary:
+      type: object
+      additionalProperties: false
+      description: Server-built display text. The UI MUST show this, not locally formatted tx fields (SEC-039).
+      required: [title, lines]
+      properties:
+        title: { type: string, maxLength: 80 }
+        lines: { type: array, maxItems: 10, items: { type: string, maxLength: 200 } }
+    StepUpChallenge:
+      type: object
+      additionalProperties: false
+      required: [challengeId, purpose, action, userId, deviceId, nonce, expiresAt, boundHash, required, summary]
+      properties:
+        challengeId: { $ref: '#/components/schemas/Uuid' }
+        purpose: { type: string, enum: [stepup] }
+        action: { type: string, enum: [transaction, enable_biometric, revoke_device] }
+        userId: { $ref: '#/components/schemas/Uuid' }
+        deviceId: { $ref: '#/components/schemas/Uuid' }
+        nonce: { $ref: '#/components/schemas/Base64Url' }
+        expiresAt: { $ref: '#/components/schemas/UnixSeconds' }
+        boundHash: { $ref: '#/components/schemas/Base64Url' }
+        txHash: { $ref: '#/components/schemas/Base64Url' }
+        required: { type: string, enum: [bio, pin, either] }
+        summary: { $ref: '#/components/schemas/StepUpSummary' }
+      example:
+        challengeId: 0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d
+        purpose: stepup
+        action: transaction
+        userId: 11111111-1111-4111-8111-111111111111
+        deviceId: 2f0c9a4e-5b1d-4c6e-9a3f-7d8e1b2c3d4e
+        nonce: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
+        expiresAt: 1767225660
+        boundHash: X1l0fN0mL8w1y0n4Wq3kVx5g0m2S8bJp9d7oUqz1HcE
+        txHash: X1l0fN0mL8w1y0n4Wq3kVx5g0m2S8bJp9d7oUqz1HcE
+        required: either
+        summary: { title: Send 1.5 ETH, lines: ['To: 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'Network: ethereum', 'Fee: 0.001 ETH'] }
+    StepUpVerifyBio:
+      type: object
+      additionalProperties: false
+      required: [challengeId, signature]
+      properties:
+        challengeId: { $ref: '#/components/schemas/Uuid' }
+        signature: { $ref: '#/components/schemas/Base64Url' }
+    StepUpVerifyPin:
+      type: object
+      additionalProperties: false
+      required: [challengeId, pin]
+      properties:
+        challengeId: { $ref: '#/components/schemas/Uuid' }
+        pin: { $ref: '#/components/schemas/Pin' }
+    StepUpVerifyRequest:
+      oneOf:
+        - $ref: '#/components/schemas/StepUpVerifyBio'
+        - $ref: '#/components/schemas/StepUpVerifyPin'
+    StepUpTokenResponse:
+      type: object
+      additionalProperties: false
+      required: [stepUpToken, expiresIn]
+      properties:
+        stepUpToken: { $ref: '#/components/schemas/OpaqueToken' }
+        expiresIn: { type: integer, maximum: 60 }
+    TransactionResponse:
+      type: object
+      additionalProperties: false
+      required: [transactionId, status, txHash]
+      properties:
+        transactionId: { $ref: '#/components/schemas/Uuid' }
+        status: { type: string, enum: [accepted_mock] }
+        txHash: { $ref: '#/components/schemas/Base64Url' }
+
+    # ---- dashboard ----
+    Balance:
+      type: object
+      additionalProperties: false
+      required: [asset, amount, value]
+      properties:
+        asset: { type: string, enum: [BTC, ETH, USDC] }
+        amount: { $ref: '#/components/schemas/DecimalString' }
+        value: { $ref: '#/components/schemas/DecimalString' }
+    Dashboard:
+      type: object
+      additionalProperties: false
+      required: [currency, totalValue, balances]
+      properties:
+        currency: { type: string, enum: [USD] }
+        totalValue: { $ref: '#/components/schemas/DecimalString' }
+        balances: { type: array, maxItems: 20, items: { $ref: '#/components/schemas/Balance' } }

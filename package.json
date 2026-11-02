@@ -1,0 +1,16 @@
+{
+  "name": "crypto-app-monorepo",
+  "private": true,
+  "packageManager": "pnpm@12.14.0",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "pnpm --filter mobile typecheck",
+    "lint": "pnpm --filter mobile lint",
+    "test": "pnpm --filter mobile test",
+    "gen:api": "pnpm --filter mobile gen:api",
+    "mock": "pnpm --filter mobile mock",
+    "android": "pnpm --filter mobile android",
+    "ios": "pnpm --filter mobile ios",
+    "contract-test": "pnpm --filter mobile contract-test"
+  }
+}

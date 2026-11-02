@@ -1,0 +1,5 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": { "modules": ["BiometricKeyModule"] },
+  "android": { "modules": ["expo.modules.biometrickey.BiometricKeyModule"] }
+}

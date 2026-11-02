@@ -1,0 +1,9 @@
+{
+  "name": "biometric-key",
+  "version": "1.0.0",
+  "description": "Hardware-backed P-256 signing key (iOS Secure Enclave / Android Keystore) gated by biometrics. Signs server challenges; never returns a boolean.",
+  "license": "UNLICENSED",
+  "author": "cryptoapp",
+  "homepage": "https://example.invalid/biometric-key",
+  "private": true
+}

@@ -1,0 +1,20 @@
+name: api
+on:
+  push:
+    paths: ['apps/api/**', 'docs/features/biometric-pin-login/openapi.yaml', '.github/workflows/api.yml', '.golangci.yml']
+  pull_request:
+    paths: ['apps/api/**', 'docs/features/biometric-pin-login/openapi.yaml', '.github/workflows/api.yml', '.golangci.yml']
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: apps/api } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: apps/api/go.mod, cache-dependency-path: apps/api/go.sum }
+      - run: make gen && git diff --exit-code -- . ':!go.sum'
+      - run: go vet ./...
+      - run: make lint
+      - run: go test -race ./...    # integration tests use testcontainers (Docker on the runner)
+      - run: make contract-test
+      - run: make vulncheck

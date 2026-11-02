@@ -1,0 +1,42 @@
+name: mobile
+on:
+  push:
+    paths: ['apps/mobile/**', 'docs/features/biometric-pin-login/openapi.yaml', 'docs/features/biometric-pin-login/vectors/**', 'package.json', 'pnpm-workspace.yaml', '.npmrc', '.nvmrc', '.github/workflows/mobile.yml']
+  pull_request:
+    paths: ['apps/mobile/**', 'docs/features/biometric-pin-login/openapi.yaml', 'docs/features/biometric-pin-login/vectors/**', 'package.json', 'pnpm-workspace.yaml', '.npmrc', '.nvmrc', '.github/workflows/mobile.yml']
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Regenerate API types from the canonical contract (must be a no-op)
+        run: |
+          pnpm --filter mobile gen:api
+          git diff --exit-code -- apps/mobile/src/api/generated
+      - run: pnpm --filter mobile typecheck
+      - run: pnpm --filter mobile lint
+      - run: pnpm --filter mobile test
+      - run: pnpm --filter mobile contract-test
+      - name: Prebuild smoke (production variant) and manifest assertions
+        working-directory: apps/mobile
+        env:
+          APP_VARIANT: production
+          CI: '1'
+        run: |
+          npx expo prebuild --no-install --clean --platform all
+          node scripts/check-manifest.mjs --variant production
+      - name: Release export and bundle scan
+        working-directory: apps/mobile
+        env:
+          EXPO_PUBLIC_API_URL: https://api.example.com
+          CI: '1'
+        run: |
+          npx expo export --platform android --output-dir dist
+          DEMO_SECRET_VALUE=ci-placeholder-secret node scripts/check-release-bundle.mjs --dir dist
