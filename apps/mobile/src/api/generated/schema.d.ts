@@ -180,9 +180,15 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Request a login challenge (unauthenticated, non-oracular)
-         * @description Always returns 200 with a well-formed challenge. For an unknown, revoked, not-enrolled or hard-locked device the nonce, challengeId and
-         *     userId are random decoys (not stored as live). Clients cannot tell the difference (SEC-029). One live login challenge per device.
+         * Request a login challenge (device credential required, non-oracular)
+         * @description CONTRACT CHANGE v1.1 (security review ruling c): requires the `deviceCredential` (the device's current refresh token in
+         *     `Authorization`), exactly like pin/verify (SEC-014). The body `deviceId` must equal the credential's device, otherwise 401
+         *     `AUTH_FAILED`. The credential is only resolved: it is NOT consumed, rotated or reuse-checked here (same as pin/verify).
+         *     This removes the anonymous case: a third party who merely knows a deviceId can neither obtain a challenge, supersede the live
+         *     challenge, disclose the userId, nor trigger failure counting.
+         *     With a valid credential the response is always a well-formed 200. If the device has no active key, biometrics are suspended
+         *     (SEC-030), or the user is hard locked, the nonce, challengeId and userId are decoys (userId derived stably per device, nothing stored as live).
+         *     Clients cannot tell the difference (SEC-029). One live login challenge per device.
          */
         post: operations["biometricChallenge"];
         delete?: never;
@@ -202,10 +208,14 @@ export interface paths {
         put?: never;
         /**
          * Verify the signed challenge -> new session (amr=bio)
-         * @description The signature is the credential (no Authorization header). The server rebuilds the signed message from its stored challenge
-         *     (contract-notes.md section 1), checks device not revoked, user not hard-locked, active key, challenge live/unconsumed, signature valid.
-         *     Every failure mode returns the identical 401 `AUTH_FAILED` (SEC-029). Allowed during a SOFT PIN lock, refused during HARD lock.
-         *     5 consecutive failures per device revoke that device's biometric key (PIN counter untouched; SEC-030).
+         * @description CONTRACT CHANGE v1.1 (security review ruling c): requires the `deviceCredential` (refresh token in `Authorization`) in addition
+         *     to the signature; the body `deviceId` must equal the credential's device. The credential is resolved without side effects (not
+         *     consumed or rotated). The server rebuilds the signed message from its stored challenge (contract-notes.md section 1), checks device
+         *     not revoked, user not hard-locked, active key, biometrics not suspended, challenge live/unconsumed, signature valid.
+         *     Every failure mode (including a missing or bad credential) returns the identical 401 `AUTH_FAILED` (SEC-029). Allowed during a
+         *     SOFT PIN lock, refused during HARD lock. 5 consecutive failures per device SUSPEND biometric login for that device until the
+         *     next successful PIN unlock (the key is NOT revoked, PIN counter untouched, audit event `BIO_SUSPENDED`; SEC-030 as amended).
+         *     Success creates a new session family (the presented refresh token is replaced by the one in the response).
          */
         post: operations["biometricVerify"];
         delete?: never;
@@ -828,6 +838,19 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
+        /**
+         * @description Shared fallback referenced by every operation as `default`, so any error status is declared: 400 `VALIDATION_ERROR`,
+         *     403 (`STEPUP_REQUIRED`, `STEPUP_INVALID`, `SCOPE_INSUFFICIENT`, `COOLING_OFF`), 404 `NOT_FOUND`, 500 `INTERNAL`, 503 `SERVICE_UNAVAILABLE`.
+         *     The body is always the uniform ErrorResponse.
+         */
+        DefaultError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
         /** @description Fail-closed (misconfiguration or store unreachable). `SERVICE_UNAVAILABLE`, never defaults to open. */
         ServiceUnavailable: {
             headers: {
@@ -842,10 +865,13 @@ export interface components {
         /** @description UUIDv4. Stored 24 h per (user, endpoint). Never logged. */
         IdempotencyKey: string;
         DeviceIdPath: string;
-        /** @description Single-use step-up token from /stepup/verify. Header only (never query). */
-        StepUpToken: components["schemas"]["OpaqueToken"];
-        /** @description Single-use step-up token from /stepup/verify. Header only (never query). */
-        StepUpTokenRequired: components["schemas"]["OpaqueToken"];
+        /**
+         * @description Single-use step-up token from /stepup/verify. Header only (never query). Declared optional in the schema so that the SERVER decides
+         *     the status: on operations that need it (POST /transactions, biometric enroll/challenge, DELETE /devices/{id} for another device) a
+         *     missing header returns 403 STEPUP_REQUIRED and an unknown, used, expired or mismatched token returns 403 STEPUP_INVALID (never 400).
+         *     Malformed format (not matching OpaqueToken) is treated as invalid: 403 STEPUP_INVALID.
+         */
+        StepUpToken: string;
     };
     requestBodies: never;
     headers: {
@@ -885,6 +911,7 @@ export interface operations {
                 };
             };
             503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     demoLogin: {
@@ -913,8 +940,18 @@ export interface operations {
             };
             400: components["responses"]["ValidationError"];
             401: components["responses"]["AuthFailed"];
+            /** @description Demo mode is off (`DEMO_MODE=false`), the route does not exist (`NOT_FOUND`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             429: components["responses"]["RateLimited"];
             503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     listDevices: {
@@ -938,6 +975,7 @@ export interface operations {
             401: components["responses"]["AuthFailed"];
             403: components["responses"]["ScopeInsufficient"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     registerDevice: {
@@ -988,13 +1026,19 @@ export interface operations {
             };
             422: components["responses"]["IdempotencyKeyReused"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     revokeDevice: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Single-use step-up token from /stepup/verify. Header only (never query). */
+                /**
+                 * @description Single-use step-up token from /stepup/verify. Header only (never query). Declared optional in the schema so that the SERVER decides
+                 *     the status: on operations that need it (POST /transactions, biometric enroll/challenge, DELETE /devices/{id} for another device) a
+                 *     missing header returns 403 STEPUP_REQUIRED and an unknown, used, expired or mismatched token returns 403 STEPUP_INVALID (never 400).
+                 *     Malformed format (not matching OpaqueToken) is treated as invalid: 403 STEPUP_INVALID.
+                 */
                 "X-StepUp-Token"?: components["parameters"]["StepUpToken"];
             };
             path: {
@@ -1015,6 +1059,7 @@ export interface operations {
             403: components["responses"]["StepUpRequired"];
             404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     changePin: {
@@ -1045,10 +1090,12 @@ export interface operations {
             };
             400: components["responses"]["ValidationError"];
             401: components["responses"]["PinOrAuthFailed"];
+            403: components["responses"]["ScopeInsufficient"];
             409: components["responses"]["IdempotentReplay"];
             422: components["responses"]["PinPolicyOrIdempotency"];
             423: components["responses"]["PinLocked"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     setPin: {
@@ -1083,6 +1130,7 @@ export interface operations {
             409: components["responses"]["PinAlreadySetOrReplay"];
             422: components["responses"]["PinPolicyOrIdempotency"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     resetPin: {
@@ -1117,6 +1165,7 @@ export interface operations {
             409: components["responses"]["IdempotentReplay"];
             422: components["responses"]["PinPolicyOrIdempotency"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     verifyPin: {
@@ -1155,6 +1204,7 @@ export interface operations {
             423: components["responses"]["PinLocked"];
             429: components["responses"]["RateLimited"];
             503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     biometricChallenge: {
@@ -1181,7 +1231,9 @@ export interface operations {
                 };
             };
             400: components["responses"]["ValidationError"];
+            401: components["responses"]["AuthFailed"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     biometricVerify: {
@@ -1210,6 +1262,7 @@ export interface operations {
             400: components["responses"]["ValidationError"];
             401: components["responses"]["AuthFailed"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     refresh: {
@@ -1241,6 +1294,7 @@ export interface operations {
                 };
             };
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     logout: {
@@ -1260,14 +1314,21 @@ export interface operations {
                 content?: never;
             };
             401: components["responses"]["AuthFailed"];
+            403: components["responses"]["ScopeInsufficient"];
+            default: components["responses"]["DefaultError"];
         };
     };
     biometricEnrollChallenge: {
         parameters: {
             query?: never;
-            header: {
-                /** @description Single-use step-up token from /stepup/verify. Header only (never query). */
-                "X-StepUp-Token": components["parameters"]["StepUpTokenRequired"];
+            header?: {
+                /**
+                 * @description Single-use step-up token from /stepup/verify. Header only (never query). Declared optional in the schema so that the SERVER decides
+                 *     the status: on operations that need it (POST /transactions, biometric enroll/challenge, DELETE /devices/{id} for another device) a
+                 *     missing header returns 403 STEPUP_REQUIRED and an unknown, used, expired or mismatched token returns 403 STEPUP_INVALID (never 400).
+                 *     Malformed format (not matching OpaqueToken) is treated as invalid: 403 STEPUP_INVALID.
+                 */
+                "X-StepUp-Token"?: components["parameters"]["StepUpToken"];
             };
             path: {
                 deviceId: components["parameters"]["DeviceIdPath"];
@@ -1290,6 +1351,7 @@ export interface operations {
             403: components["responses"]["StepUpRequired"];
             404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     biometricEnroll: {
@@ -1341,6 +1403,7 @@ export interface operations {
                 };
             };
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     biometricDisable: {
@@ -1365,6 +1428,7 @@ export interface operations {
             403: components["responses"]["StepUpRequired"];
             404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     stepupChallenge: {
@@ -1396,6 +1460,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             422: components["responses"]["ValidationUnprocessable"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     stepupVerify: {
@@ -1426,6 +1491,7 @@ export interface operations {
             403: components["responses"]["StepUpRequired"];
             423: components["responses"]["PinLocked"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     createTransaction: {
@@ -1434,8 +1500,13 @@ export interface operations {
             header: {
                 /** @description UUIDv4. Stored 24 h per (user, endpoint). Never logged. */
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-                /** @description Single-use step-up token from /stepup/verify. Header only (never query). */
-                "X-StepUp-Token": components["parameters"]["StepUpTokenRequired"];
+                /**
+                 * @description Single-use step-up token from /stepup/verify. Header only (never query). Declared optional in the schema so that the SERVER decides
+                 *     the status: on operations that need it (POST /transactions, biometric enroll/challenge, DELETE /devices/{id} for another device) a
+                 *     missing header returns 403 STEPUP_REQUIRED and an unknown, used, expired or mismatched token returns 403 STEPUP_INVALID (never 400).
+                 *     Malformed format (not matching OpaqueToken) is treated as invalid: 403 STEPUP_INVALID.
+                 */
+                "X-StepUp-Token"?: components["parameters"]["StepUpToken"];
             };
             path?: never;
             cookie?: never;
@@ -1477,6 +1548,7 @@ export interface operations {
                 };
             };
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
     getDashboard: {
@@ -1501,6 +1573,7 @@ export interface operations {
             401: components["responses"]["AuthFailed"];
             403: components["responses"]["ScopeInsufficient"];
             429: components["responses"]["RateLimited"];
+            default: components["responses"]["DefaultError"];
         };
     };
 }
