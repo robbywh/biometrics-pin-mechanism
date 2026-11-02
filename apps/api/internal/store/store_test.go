@@ -35,7 +35,7 @@ func seed(t *testing.T, s *store.Store, name string) uuid.UUID {
 	return id
 }
 
-// Expected tables/columns derived from docs/features/biometric-pin-login/erd.md.
+// Expected tables/columns derived from docs/features/biometric-pin-login/diagrams/erd/.
 var erd = map[string][]string{
 	"users":               {"id", "username", "pin_hash", "pepper_version", "pin_set_at", "fail_count", "locked_until", "hard_locked", "failures_since_unlock", "last_failure_at", "cooling_off_until", "created_at"},
 	"devices":             {"id", "user_id", "platform", "name", "risk", "created_at", "last_seen_at", "cooling_off_until", "revoked_at"},
