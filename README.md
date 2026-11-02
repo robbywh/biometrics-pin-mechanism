@@ -101,7 +101,7 @@ The feature was produced with a spec-first workflow, run with `/secure-feature`:
 5. **security-specialist** reviews the code against the spec.
 
 The artifacts for this feature are in `docs/features/biometric-pin-login/`:
-`draft.md`, `security-spec.md`, `openapi.yaml`, `contract-notes.md`, `decisions.md`, `erd.md`, `tasks-backend.md`, `tasks-expo.md` and `vectors/vectors.json`. The security review (`security-review.md`) is added when step 5 finishes.
+`draft.md`, `security-spec.md`, `openapi.yaml`, `contract-notes.md`, `decisions.md`, `diagrams/erd/` (schema), `diagrams/sequences/` (9 flows), `tasks-backend.md`, `tasks-expo.md` and `vectors/vectors.json`. The security review (`security-review.md`) is added when step 5 finishes.
 
 ## Status and known gaps
 
