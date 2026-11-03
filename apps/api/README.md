@@ -1,7 +1,7 @@
 # apps/api - PIN and biometric login backend (Go)
 
 Single Go module `github.com/cryptoapp/api`. Contract: `../../docs/features/biometric-pin-login/openapi.yaml` (the only coupling with the Expo app).
-Security spec: `../../docs/features/biometric-pin-login/security-spec.md`. Schema: `../../docs/features/biometric-pin-login/erd.md`.
+Security spec: `../../docs/features/biometric-pin-login/security-spec.md`. Schema: `../../docs/features/biometric-pin-login/diagrams/erd/`.
 
 ## Run (demo, localhost/LAN only: never expose this to the internet)
 
